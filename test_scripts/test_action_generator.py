@@ -12,9 +12,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import torch
+from torchvision import datasets, transforms as T
 
-from glimpse import Action, ActionGenerator, GlimpseTransform
+from glimpse import (
+    Action,
+    ActionGenerator,
+    GlimpseTransform,
+    RandomWalkGenerator,
+    ReturnToOriginGenerator,
+)
 
 
 class _DummyGenerator(ActionGenerator):
@@ -46,8 +55,6 @@ def test_base_helpers_shapes_and_dtypes():
 
 
 def test_random_walk_shapes_bounds_and_padding():
-    from glimpse import RandomWalkGenerator
-
     init_bounds = Action(zoom=0.4, tx=0.5, ty=0.5)
     step_bounds = Action(zoom=0.05, tx=0.1, ty=0.1)
     gen = RandomWalkGenerator(init_bounds=init_bounds, T_max=8, step_bounds=step_bounds)
@@ -80,8 +87,6 @@ def test_random_walk_shapes_bounds_and_padding():
 
 
 def test_random_walk_default_step_bounds_division():
-    from glimpse import RandomWalkGenerator
-
     init_bounds = Action(zoom=1.0, tx=2.0, ty=3.0)
     gen = RandomWalkGenerator(init_bounds=init_bounds, T_max=10)  # no step_bounds
     assert float(gen.step_bounds.zoom) == 1.0 / 10
@@ -91,8 +96,6 @@ def test_random_walk_default_step_bounds_division():
 
 
 def test_random_walk_reproducibility():
-    from glimpse import RandomWalkGenerator
-
     gen = RandomWalkGenerator(init_bounds=Action(zoom=0.3, tx=0.4, ty=0.4), T_max=5)
     g1 = torch.Generator().manual_seed(42)
     g2 = torch.Generator().manual_seed(42)
@@ -107,8 +110,6 @@ def test_random_walk_reproducibility():
 
 
 def test_return_to_origin_lands_on_zero_and_constant_deltas():
-    from glimpse import ReturnToOriginGenerator
-
     init_bounds = Action(zoom=0.3, tx=0.5, ty=0.5)
     gen = ReturnToOriginGenerator(init_bounds=init_bounds, T_max=7)
     B = 128
@@ -140,8 +141,6 @@ def test_return_to_origin_lands_on_zero_and_constant_deltas():
 
 
 def test_return_to_origin_t_stop_one_edge_case():
-    from glimpse import ReturnToOriginGenerator
-
     gen = ReturnToOriginGenerator(init_bounds=Action(zoom=0.5, tx=0.5, ty=0.5), T_max=4)
 
     # force t_stop = 1 by patching _sample_t_stop
@@ -174,8 +173,6 @@ def test_glimpse_transform_set_state_installs_action():
 
 def test_integration_return_to_origin_lands_on_origin_via_transform():
     """Apply each delta through GlimpseTransform; verify cumulative state."""
-    from glimpse import ReturnToOriginGenerator
-
     init_bounds = Action(zoom=0.3, tx=0.4, ty=0.4)
     T_max = 5
     gen = ReturnToOriginGenerator(init_bounds=init_bounds, T_max=T_max)
@@ -200,8 +197,6 @@ def test_integration_return_to_origin_lands_on_origin_via_transform():
 
 
 def test_integration_random_walk_state_matches_cumsum():
-    from glimpse import RandomWalkGenerator
-
     gen = RandomWalkGenerator(
         init_bounds=Action(zoom=0.3, tx=0.4, ty=0.4),
         T_max=6,
@@ -228,6 +223,103 @@ def test_integration_random_walk_state_matches_cumsum():
     print("[integration] random-walk cumulative state matches cumsum OK")
 
 
+def _load_mnist_batch(n: int) -> torch.Tensor:
+    ds = datasets.MNIST(REPO_ROOT / "dataset", train=True, transform=T.ToTensor())
+    return torch.stack([ds[i][0] for i in range(n)])
+
+
+def _render_trajectory(
+    gen: ActionGenerator,
+    imgs: torch.Tensor,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a trajectory through GlimpseTransform.
+
+    Returns:
+        views: ``(B, T_max+1, 1, H, W)`` — view at each cumulative step.
+        t_stop: ``(B,)`` long tensor.
+    """
+    B = imgs.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    init, deltas, t_stop = gen.sample(B, imgs.device, imgs.dtype, generator=g)
+
+    transform = GlimpseTransform()
+    transform.set_batch(imgs)
+    transform.set_state(init)
+
+    views = [transform.transform(Action())]  # step 0: identity delta -> shows init state
+    for k in range(gen.T_max):
+        d = Action(zoom=deltas[:, k, 0], tx=deltas[:, k, 1], ty=deltas[:, k, 2])
+        views.append(transform.transform(d))
+
+    return torch.stack(views, dim=1), t_stop  # (B, T_max+1, 1, H, W)
+
+
+def plot_trajectory_grid(
+    views: torch.Tensor,
+    t_stop: torch.Tensor,
+    title: str,
+    save_path: Path,
+) -> None:
+    """Plot a (B, T_max+1) grid of glimpse views; mark the ``t_stop`` step.
+
+    Args:
+        views: ``(B, T_max+1, 1, H, W)`` tensor.
+        t_stop: ``(B,)`` long tensor; column ``t_stop[b]`` is highlighted on
+            row ``b``.
+    """
+    B, T1 = views.shape[:2]
+    fig, axes = plt.subplots(B, T1, figsize=(T1 * 1.1, B * 1.2))
+    if B == 1:
+        axes = axes.reshape(1, -1)
+
+    for b in range(B):
+        ts = int(t_stop[b].item())
+        for k in range(T1):
+            ax = axes[b, k]
+            ax.imshow(views[b, k, 0].detach().cpu(), cmap="gray", vmin=0.0, vmax=1.0)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if b == 0:
+                ax.set_title(f"k={k}", fontsize=8)
+            if k == 0:
+                ax.set_ylabel(f"b={b}", fontsize=8)
+            if k == ts:
+                # red border to mark the t_stop step
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("red")
+                    spine.set_linewidth(2.5)
+                ax.set_xlabel("t_stop", color="red", fontsize=8)
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    print(f"saved figure to {save_path}")
+    plt.close(fig)
+
+
+def visual_sanity_plots():
+    imgs = _load_mnist_batch(n=4)
+    init_bounds = Action(zoom=0.3, tx=0.5, ty=0.5)
+    T_max = 6
+
+    rw_gen = RandomWalkGenerator(init_bounds=init_bounds, T_max=T_max)
+    rw_views, rw_tstop = _render_trajectory(rw_gen, imgs, seed=1)
+    plot_trajectory_grid(
+        rw_views, rw_tstop,
+        title="RandomWalkGenerator — red border = t_stop",
+        save_path=REPO_ROOT / "test_scripts" / "action_generator_random_walk.png",
+    )
+
+    rt_gen = ReturnToOriginGenerator(init_bounds=init_bounds, T_max=T_max)
+    rt_views, rt_tstop = _render_trajectory(rt_gen, imgs, seed=2)
+    plot_trajectory_grid(
+        rt_views, rt_tstop,
+        title="ReturnToOriginGenerator — red border = t_stop",
+        save_path=REPO_ROOT / "test_scripts" / "action_generator_return_to_origin.png",
+    )
+
+
 def main():
     torch.manual_seed(0)
     test_base_helpers_shapes_and_dtypes()
@@ -239,6 +331,7 @@ def main():
     test_glimpse_transform_set_state_installs_action()
     test_integration_return_to_origin_lands_on_origin_via_transform()
     test_integration_random_walk_state_matches_cumsum()
+    visual_sanity_plots()
 
 
 if __name__ == "__main__":

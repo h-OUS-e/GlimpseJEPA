@@ -361,3 +361,76 @@ class ActionGenerator(ABC):
     ) -> tuple[Action, torch.Tensor, torch.Tensor]:
         """Return ``(init, deltas, t_stop)`` for a fresh batch of trajectories."""
         raise NotImplementedError
+
+
+class RandomWalkGenerator(ActionGenerator):
+    """Random-walk trajectory schedule.
+
+    For each sample ``b``, the trajectory is:
+    ``state_0 = init[b]`` then for ``k < t_stop[b]``,
+    ``deltas[b, k, axis] ~ U[-step_bounds.<axis>, +step_bounds.<axis>]``
+    independently per axis and step. For ``k >= t_stop[b]``, ``deltas`` is
+    zero (glimpse stays still). No clipping — cumulative state may drift
+    outside ``init_bounds``.
+
+    Edge cases:
+        * ``T_max = 1``: legal; ``t_stop`` is always 1, ``deltas`` is ``(B, 1, 3)``.
+        * ``init_bounds`` field is 0: that axis is always 0 in ``init`` but the
+          delta on that axis is unaffected (sampled from ``step_bounds``).
+        * ``step_bounds > init_bounds``: legal but unusual — random walk may
+          drift outside the init range.
+
+    Args:
+        init_bounds: See :class:`ActionGenerator`.
+        T_max: See :class:`ActionGenerator`.
+        step_bounds: Half-widths of the per-step uniform delta ranges. Must be
+            non-negative scalars or 0-d tensors. Defaults to
+            ``init_bounds / T_max`` so per-step delta magnitudes are
+            comparable to a return-to-origin schedule.
+    """
+
+    def __init__(
+        self,
+        init_bounds: Action,
+        T_max: int,
+        step_bounds: Action | None = None,
+    ):
+        super().__init__(init_bounds, T_max)
+        if step_bounds is None:
+            step_bounds = Action(
+                zoom=float(self._scalar(init_bounds.zoom)) / T_max,
+                tx=float(self._scalar(init_bounds.tx)) / T_max,
+                ty=float(self._scalar(init_bounds.ty)) / T_max,
+            )
+        for name in ("zoom", "tx", "ty"):
+            self._check_bound(getattr(step_bounds, name), f"step_bounds.{name}")
+        self.step_bounds = step_bounds
+
+    @staticmethod
+    def _scalar(v):
+        return float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+
+    def sample(self, B, device, dtype, generator=None):
+        init = self._sample_init(B, device, dtype, generator)
+        t_stop = self._sample_t_stop(B, device, generator)
+
+        # uniform deltas in [-bound, +bound] per axis, full (B, T_max) tensor
+        u = torch.rand(B, self.T_max, 3, device=device, dtype=dtype, generator=generator)
+        u = u * 2.0 - 1.0
+        bounds = torch.tensor(
+            [
+                self._scalar(self.step_bounds.zoom),
+                self._scalar(self.step_bounds.tx),
+                self._scalar(self.step_bounds.ty),
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        deltas = u * bounds  # broadcast (B, T_max, 3) * (3,)
+
+        # zero out deltas at k >= t_stop[b]
+        k_idx = torch.arange(self.T_max, device=device).unsqueeze(0)  # (1, T_max)
+        active = (k_idx < t_stop.unsqueeze(1)).to(dtype)               # (B, T_max)
+        deltas = deltas * active.unsqueeze(-1)
+
+        return init, deltas, t_stop

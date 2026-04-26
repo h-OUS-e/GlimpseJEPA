@@ -145,6 +145,25 @@ class GlimpseTransform:
         # separate clones so future in-place ops on one field don't alias others
         self._state = Action(zoom=zeros, tx=zeros.clone(), ty=zeros.clone())
 
+    def set_state(self, state: Action) -> None:
+        """Install a known cumulative action as the current state.
+
+        Each field of ``state`` must already be a ``(B,)`` tensor matching the
+        stored batch (use :meth:`Action.to_batched` to broadcast scalars).
+        Useful for initializing the transform from an externally-sampled
+        action (e.g. one returned by :class:`ActionGenerator`).
+        """
+        x = self.batch
+        B = x.shape[0]
+        for name in ("zoom", "tx", "ty"):
+            t = getattr(state, name)
+            if not isinstance(t, torch.Tensor) or t.shape != (B,):
+                raise ValueError(
+                    f"state.{name} must be a tensor of shape ({B},); got "
+                    f"{type(t).__name__} {getattr(t, 'shape', None)}"
+                )
+        self._state = state
+
     def initialize_batch(
         self,
         x: torch.Tensor | None = None,

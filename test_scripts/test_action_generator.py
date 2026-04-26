@@ -157,6 +157,21 @@ def test_return_to_origin_t_stop_one_edge_case():
     print("[return-to-origin] t_stop=1 edge case OK")
 
 
+def test_glimpse_transform_set_state_installs_action():
+    g = GlimpseTransform()
+    x = torch.zeros(4, 1, 28, 28)
+    g.set_batch(x)
+
+    # known state, broadcast to (B,)
+    init = Action(zoom=0.1, tx=0.2, ty=-0.3).to_batched(4, device=x.device, dtype=x.dtype)
+    g.set_state(init)
+
+    assert torch.allclose(g.state.zoom, init.zoom)
+    assert torch.allclose(g.state.tx, init.tx)
+    assert torch.allclose(g.state.ty, init.ty)
+    print("[glimpse] set_state installs action OK")
+
+
 def main():
     torch.manual_seed(0)
     test_base_helpers_shapes_and_dtypes()
@@ -165,6 +180,7 @@ def main():
     test_random_walk_reproducibility()
     test_return_to_origin_lands_on_zero_and_constant_deltas()
     test_return_to_origin_t_stop_one_edge_case()
+    test_glimpse_transform_set_state_installs_action()
 
 
 if __name__ == "__main__":

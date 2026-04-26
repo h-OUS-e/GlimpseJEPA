@@ -1,0 +1,259 @@
+"""Batched glimpse transform for JEPA-style training.
+
+Generates zoomed/translated views of an image batch by accumulating per-step
+actions on top of a stored source. All ops are vectorized over the batch via
+``F.affine_grid`` + ``F.grid_sample``.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from pydantic import BaseModel, ConfigDict
+
+
+class Action(BaseModel):
+    """A (zoom, tx, ty) triple in the source-image normalized frame.
+
+    ``zoom`` is in log-scale space: the actual scale factor applied is
+    ``exp(zoom)``. Positive values zoom in, negative values zoom out, and
+    deltas compose by simple addition (which becomes multiplication in
+    scale-space). ``tx`` / ``ty`` are absolute offsets in ``[-1, 1]`` where
+    ``±1`` is the image edge.
+
+    Fields may be Python floats (scalars — useful for sampling bounds or
+    broadcasting a uniform delta across the batch) or 1-D tensors of shape
+    ``(B,)`` for per-sample batched deltas and cumulative state.
+
+    Attributes:
+        zoom: Log-scale zoom. ``0`` is identity.
+        tx: Horizontal offset in normalized source coords.
+        ty: Vertical offset in normalized source coords.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    zoom: float | torch.Tensor = 0.0
+    tx: float | torch.Tensor = 0.0
+    ty: float | torch.Tensor = 0.0
+
+    def to_batched(self, B: int, device, dtype) -> "Action":
+        """Materialize all fields as ``(B,)`` tensors on the given device/dtype.
+
+        Args:
+            B: Batch size to broadcast scalar fields to.
+            device: Target device.
+            dtype: Target floating-point dtype.
+
+        Returns:
+            A new ``Action`` whose fields are all ``(B,)`` tensors.
+        """
+
+        def b(v):
+            # tensor: just move; 0-d tensors expand to (B,)
+            if isinstance(v, torch.Tensor):
+                t = v.to(device=device, dtype=dtype)
+                if t.dim() == 0:
+                    t = t.expand(B)
+                return t
+            # scalar -> filled (B,) tensor
+            return torch.full((B,), float(v), device=device, dtype=dtype)
+
+        return Action(zoom=b(self.zoom), tx=b(self.tx), ty=b(self.ty))
+
+    def __add__(self, other: "Action") -> "Action":
+        """Component-wise sum of two actions (used to accumulate state)."""
+        return Action(
+            zoom=self.zoom + other.zoom,
+            tx=self.tx + other.tx,
+            ty=self.ty + other.ty,
+        )
+
+
+class GlimpseTransform:
+    """Stateful, batched zoom + translate transform.
+
+    Stores a source batch and a cumulative ``Action`` state. Each call to
+    ``transform`` applies a *delta* on top of the current state and renders
+    the resulting view at the source resolution. The whole batch is processed
+    in a single ``affine_grid`` + ``grid_sample`` op (one fused CUDA kernel).
+
+    Attributes:
+        init_bounds: Half-widths of the uniform sampling ranges used by
+            ``initialize_batch``. Each field gives the symmetric range
+            ``[-field, +field]`` for that parameter.
+        device: Optional device to move stored batches onto.
+        mode: ``grid_sample`` interpolation mode (default ``"bilinear"``).
+        padding_mode: ``grid_sample`` padding mode for samples that fall
+            outside the source canvas (default ``"border"`` — replicates the
+            edge pixel, which is what we want for zoom-out).
+        align_corners: Forwarded to ``affine_grid`` / ``grid_sample``.
+    """
+
+    def __init__(
+        self,
+        init_bounds: Action | None = None,
+        device: torch.device | None = None,
+        mode: str = "bilinear",
+        padding_mode: str = "border",
+        align_corners: bool = False,
+    ):
+        # default bounds: ±0.3 log-zoom (~0.74x to ~1.35x), ±0.5 translation
+        self.init_bounds = (
+            init_bounds if init_bounds is not None else Action(zoom=1, tx=1, ty=1)
+        )
+        self.device = device
+        self.mode = mode
+        self.padding_mode = padding_mode
+        self.align_corners = align_corners
+
+        # source batch (B, C, H, W) — set via set_batch / initialize_batch
+        self._batch: torch.Tensor | None = None
+        # cumulative per-sample state; fields are (B,) tensors
+        self._state: Action | None = None
+
+    def set_batch(self, x: torch.Tensor) -> "GlimpseTransform":
+        """Store a fresh source batch and reset state to identity.
+
+        Args:
+            x: Source images of shape ``(B, C, H, W)``.
+
+        Returns:
+            ``self``, to allow chaining.
+        """
+        if x.dim() != 4:
+            raise ValueError(f"expected (B, C, H, W), got shape {tuple(x.shape)}")
+        # save the source; reset accumulated state since this is a new batch
+        self._batch = x.to(self.device) if self.device is not None else x
+        self.reset_state()
+        return self
+
+    def reset_state(self) -> None:
+        """Zero the cumulative action state (next render shows the source as-is)."""
+        x = self.batch
+        B = x.shape[0]
+        zeros = torch.zeros(B, device=x.device, dtype=x.dtype)
+        # separate clones so future in-place ops on one field don't alias others
+        self._state = Action(zoom=zeros, tx=zeros.clone(), ty=zeros.clone())
+
+    def initialize_batch(
+        self,
+        x: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Action:
+        """Set state to a per-sample random action drawn from ``init_bounds``.
+
+        Each field is sampled uniformly from ``[-bound, +bound]`` where
+        ``bound`` is the corresponding field of ``self.init_bounds``.
+
+        Args:
+            x: Optional fresh source batch. If given, ``set_batch(x)`` is
+                called first, otherwise the previously-stored batch is used.
+            generator: Optional ``torch.Generator`` for reproducible sampling.
+
+        Returns:
+            The sampled initial ``Action`` (also stored as ``self.state``).
+        """
+        if x is not None:
+            self.set_batch(x)
+        b = self.batch
+        B = b.shape[0]
+
+        def sample(half_width):
+            # scalar bound -> uniform in [-hw, +hw]
+            hw = (
+                float(half_width)
+                if not isinstance(half_width, torch.Tensor)
+                else float(half_width.item())
+            )
+            u = torch.rand(B, device=b.device, dtype=b.dtype, generator=generator)
+            return (u * 2.0 - 1.0) * hw
+
+        # save the new initial action state
+        self._state = Action(
+            zoom=sample(self.init_bounds.zoom),
+            tx=sample(self.init_bounds.tx),
+            ty=sample(self.init_bounds.ty),
+        )
+        return self._state
+
+    @property
+    def batch(self) -> torch.Tensor:
+        """The currently stored source batch."""
+        if self._batch is None:
+            raise RuntimeError("call set_batch() or initialize_batch() first")
+        return self._batch
+
+    @property
+    def state(self) -> Action:
+        """The current cumulative action (per-sample tensors of shape ``(B,)``)."""
+        if self._state is None:
+            raise RuntimeError("no state; call set_batch() or initialize_batch() first")
+        return self._state
+
+    def transform(self, delta: Action) -> torch.Tensor:
+        """Accumulate ``delta`` into state and render the resulting view.
+
+        The new state is ``self.state + delta``. The rendered view samples
+        the source via an inverse affine map built from the new state:
+        scale ``= exp(state.zoom)`` along both axes, then translation by
+        ``(state.tx, state.ty)`` in normalized source coords.
+
+        Args:
+            delta: Per-sample delta to apply on top of the current state.
+                Scalar fields broadcast across the batch; tensor fields must
+                be shape ``(B,)`` (or 0-d, which also broadcasts).
+
+        Returns:
+            View tensor of shape ``(B, C, H, W)`` — same resolution as the
+            source.
+        """
+        x = self.batch
+        B = x.shape[0]
+
+        # broadcast / move the delta onto the batch device/dtype
+        delta_b = delta.to_batched(B, device=x.device, dtype=x.dtype)
+        for name, t in (("zoom", delta_b.zoom), ("tx", delta_b.tx), ("ty", delta_b.ty)):
+            assert isinstance(t, torch.Tensor)
+            if t.shape != (B,):
+                raise ValueError(
+                    f"delta.{name} must broadcast to ({B},), got {tuple(t.shape)}"
+                )
+
+        # accumulate: new_state = old_state + delta
+        self._state = self.state + delta_b
+
+        zoom = self._state.zoom
+        tx = self._state.tx
+        ty = self._state.ty
+        assert (
+            isinstance(zoom, torch.Tensor)
+            and isinstance(tx, torch.Tensor)
+            and isinstance(ty, torch.Tensor)
+        )
+
+        # affine_grid's theta maps OUTPUT coords -> INPUT coords, so the
+        # diagonal is the inverse of the visual scale: zoom-in (scale > 1)
+        # samples a smaller window of the source (1/scale < 1).
+        inv_scale = torch.exp(-zoom)
+        zero = torch.zeros_like(inv_scale)
+
+        # theta[b] = [[inv_scale, 0, tx],
+        #             [0, inv_scale, ty]]
+        theta = torch.stack(
+            [
+                torch.stack([inv_scale, zero, tx], dim=-1),
+                torch.stack([zero, inv_scale, ty], dim=-1),
+            ],
+            dim=-2,
+        )
+
+        # one fused kernel: build sampling grid + bilinear sample with border padding
+        grid = F.affine_grid(theta, size=x.shape, align_corners=self.align_corners)
+        return F.grid_sample(
+            x,
+            grid,
+            mode=self.mode,
+            padding_mode=self.padding_mode,
+            align_corners=self.align_corners,
+        )

@@ -13,7 +13,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import torch
 from torchvision import datasets, transforms as T
 

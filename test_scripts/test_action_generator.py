@@ -106,12 +106,65 @@ def test_random_walk_reproducibility():
     print("[random-walk] reproducibility OK")
 
 
+def test_return_to_origin_lands_on_zero_and_constant_deltas():
+    from glimpse import ReturnToOriginGenerator
+
+    init_bounds = Action(zoom=0.3, tx=0.5, ty=0.5)
+    gen = ReturnToOriginGenerator(init_bounds=init_bounds, T_max=7)
+    B = 128
+    init, deltas, t_stop = gen.sample(B, torch.device("cpu"), torch.float32)
+
+    # shapes
+    assert deltas.shape == (B, 7, 3)
+
+    # 1) cumulative sum of deltas equals -init (per axis, per sample)
+    delta_sum = deltas.sum(dim=1)  # (B, 3)
+    init_stack = torch.stack([init.zoom, init.tx, init.ty], dim=-1)  # (B, 3)
+    assert torch.allclose(delta_sum, -init_stack, atol=1e-5), "did not land on origin"
+
+    # 2) for k < t_stop, all deltas[b, k] are identical across k (constant)
+    for b in range(B):
+        ts = int(t_stop[b].item())
+        active = deltas[b, :ts]            # (ts, 3)
+        first = active[0]
+        assert torch.allclose(active, first.expand_as(active), atol=1e-6), (
+            f"sample {b}: deltas not constant for k < t_stop={ts}"
+        )
+
+    # 3) padding: k >= t_stop must be zero
+    k_idx = torch.arange(7).unsqueeze(0)
+    padding_mask = k_idx >= t_stop.unsqueeze(1)  # (B, 7)
+    assert (deltas[padding_mask] == 0).all(), "padding contains non-zero deltas"
+
+    print("[return-to-origin] lands on origin, constant deltas, padding OK")
+
+
+def test_return_to_origin_t_stop_one_edge_case():
+    from glimpse import ReturnToOriginGenerator
+
+    gen = ReturnToOriginGenerator(init_bounds=Action(zoom=0.5, tx=0.5, ty=0.5), T_max=4)
+
+    # force t_stop = 1 by patching _sample_t_stop
+    B = 16
+    init = gen._sample_init(B, torch.device("cpu"), torch.float32, None)
+    t_stop = torch.ones(B, dtype=torch.long)
+    deltas = gen._build_deltas(init, t_stop, torch.device("cpu"), torch.float32)
+
+    # delta[b, 0] = -init[b]; delta[b, 1:] = 0
+    expected_first = -torch.stack([init.zoom, init.tx, init.ty], dim=-1)
+    assert torch.allclose(deltas[:, 0], expected_first, atol=1e-6)
+    assert (deltas[:, 1:] == 0).all()
+    print("[return-to-origin] t_stop=1 edge case OK")
+
+
 def main():
     torch.manual_seed(0)
     test_base_helpers_shapes_and_dtypes()
     test_random_walk_shapes_bounds_and_padding()
     test_random_walk_default_step_bounds_division()
     test_random_walk_reproducibility()
+    test_return_to_origin_lands_on_zero_and_constant_deltas()
+    test_return_to_origin_t_stop_one_edge_case()
 
 
 if __name__ == "__main__":

@@ -434,3 +434,53 @@ class RandomWalkGenerator(ActionGenerator):
         deltas = deltas * active.unsqueeze(-1)
 
         return init, deltas, t_stop
+
+
+class ReturnToOriginGenerator(ActionGenerator):
+    """Linear return-to-origin trajectory schedule.
+
+    For each sample ``b``, ``init[b]`` is sampled per the base class. The
+    constant per-step delta ``-init[b] / t_stop[b]`` is broadcast across
+    ``k = 0, ..., t_stop[b] - 1`` so the cumulative state at step
+    ``t_stop[b]`` is exactly the origin ``(0, 0, 0)``. For ``k >= t_stop[b]``
+    the delta is zero (already at origin).
+
+    Edge cases:
+        * ``T_max = 1``: legal; ``t_stop`` is always 1, the single delta is
+          ``-init`` (lands on origin in one step).
+        * ``t_stop = 1`` (any ``T_max``): single delta of ``-init``; falls out
+          of the ``-init / t_stop`` formula with no special case.
+        * ``init_bounds`` field is 0: that axis is always 0 in ``init``, so
+          the corresponding delta is also 0.
+
+    Args:
+        init_bounds: See :class:`ActionGenerator`.
+        T_max: See :class:`ActionGenerator`.
+    """
+
+    def __init__(self, init_bounds: Action, T_max: int):
+        super().__init__(init_bounds, T_max)
+
+    def _build_deltas(
+        self,
+        init: Action,
+        t_stop: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Construct ``(B, T_max, 3)`` deltas given a sampled init and t_stop."""
+        B = t_stop.shape[0]
+        init_stack = torch.stack([init.zoom, init.tx, init.ty], dim=-1)  # (B, 3)
+        per_step = -init_stack / t_stop.to(dtype).unsqueeze(-1)          # (B, 3)
+
+        # broadcast per_step across T_max, then zero out k >= t_stop
+        deltas = per_step.unsqueeze(1).expand(B, self.T_max, 3).clone()  # (B, T_max, 3)
+        k_idx = torch.arange(self.T_max, device=device).unsqueeze(0)     # (1, T_max)
+        active = (k_idx < t_stop.unsqueeze(1)).to(dtype).unsqueeze(-1)   # (B, T_max, 1)
+        return deltas * active
+
+    def sample(self, B, device, dtype, generator=None):
+        init = self._sample_init(B, device, dtype, generator)
+        t_stop = self._sample_t_stop(B, device, generator)
+        deltas = self._build_deltas(init, t_stop, device, dtype)
+        return init, deltas, t_stop

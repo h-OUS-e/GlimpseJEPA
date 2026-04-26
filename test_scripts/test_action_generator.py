@@ -172,6 +172,62 @@ def test_glimpse_transform_set_state_installs_action():
     print("[glimpse] set_state installs action OK")
 
 
+def test_integration_return_to_origin_lands_on_origin_via_transform():
+    """Apply each delta through GlimpseTransform; verify cumulative state."""
+    from glimpse import ReturnToOriginGenerator
+
+    init_bounds = Action(zoom=0.3, tx=0.4, ty=0.4)
+    T_max = 5
+    gen = ReturnToOriginGenerator(init_bounds=init_bounds, T_max=T_max)
+
+    B = 16
+    x = torch.zeros(B, 1, 28, 28)
+    init, deltas, t_stop = gen.sample(B, x.device, x.dtype)
+
+    g = GlimpseTransform()
+    g.set_batch(x)
+    g.set_state(init)
+
+    for k in range(T_max):
+        d = Action(zoom=deltas[:, k, 0], tx=deltas[:, k, 1], ty=deltas[:, k, 2])
+        g.transform(d)
+
+    # final cumulative state == 0 (each sample reached origin at t_stop and stayed)
+    assert torch.allclose(g.state.zoom, torch.zeros(B), atol=1e-5)
+    assert torch.allclose(g.state.tx,   torch.zeros(B), atol=1e-5)
+    assert torch.allclose(g.state.ty,   torch.zeros(B), atol=1e-5)
+    print("[integration] return-to-origin reaches origin via GlimpseTransform OK")
+
+
+def test_integration_random_walk_state_matches_cumsum():
+    from glimpse import RandomWalkGenerator
+
+    gen = RandomWalkGenerator(
+        init_bounds=Action(zoom=0.3, tx=0.4, ty=0.4),
+        T_max=6,
+        step_bounds=Action(zoom=0.05, tx=0.1, ty=0.1),
+    )
+    B = 8
+    x = torch.zeros(B, 1, 28, 28)
+    init, deltas, t_stop = gen.sample(B, x.device, x.dtype)
+
+    g = GlimpseTransform()
+    g.set_batch(x)
+    g.set_state(init)
+    for k in range(gen.T_max):
+        d = Action(zoom=deltas[:, k, 0], tx=deltas[:, k, 1], ty=deltas[:, k, 2])
+        g.transform(d)
+
+    # final state should equal init + cumulative sum of deltas
+    expected_zoom = init.zoom + deltas[..., 0].sum(dim=1)
+    expected_tx   = init.tx   + deltas[..., 1].sum(dim=1)
+    expected_ty   = init.ty   + deltas[..., 2].sum(dim=1)
+    assert torch.allclose(g.state.zoom, expected_zoom, atol=1e-5)
+    assert torch.allclose(g.state.tx,   expected_tx,   atol=1e-5)
+    assert torch.allclose(g.state.ty,   expected_ty,   atol=1e-5)
+    print("[integration] random-walk cumulative state matches cumsum OK")
+
+
 def main():
     torch.manual_seed(0)
     test_base_helpers_shapes_and_dtypes()
@@ -181,6 +237,8 @@ def main():
     test_return_to_origin_lands_on_zero_and_constant_deltas()
     test_return_to_origin_t_stop_one_edge_case()
     test_glimpse_transform_set_state_installs_action()
+    test_integration_return_to_origin_lands_on_origin_via_transform()
+    test_integration_random_walk_state_matches_cumsum()
 
 
 if __name__ == "__main__":

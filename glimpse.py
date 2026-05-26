@@ -13,493 +13,255 @@ ActionGenerator design note (Q1 — trajectory length):
 """
 
 from __future__ import annotations
-
-from abc import ABC, abstractmethod
-
 import torch
 import torch.nn.functional as F
-from pydantic import BaseModel, ConfigDict
 
 
-class Action(BaseModel):
-    """A (zoom, tx, ty) triple in the source-image normalized frame.
 
-    ``zoom`` is in log-scale space: the actual scale factor applied is
-    ``exp(zoom)``. Positive values zoom in, negative values zoom out, and
-    deltas compose by simple addition (which becomes multiplication in
-    scale-space). ``tx`` / ``ty`` are absolute offsets in ``[-1, 1]`` where
-    ``±1`` is the image edge.
-
-    Fields may be Python floats (scalars — useful for sampling bounds or
-    broadcasting a uniform delta across the batch) or 1-D tensors of shape
-    ``(B,)`` for per-sample batched deltas and cumulative state.
+class GlimpseAction:
+    """
+    An action that changes the glimpse by a delta (log_scale, x, y).
+    Takes in log_scale, x, and y from an ML model action output.
 
     Attributes:
-        zoom: Log-scale zoom. ``0`` is identity.
-        tx: Horizontal offset in normalized source coords.
-        ty: Vertical offset in normalized source coords.
+        log_scale:
+            0.0 means no zoom.
+            log(2) means zoom in 2x.
+            log(1/2) means zoom out 2x. -log(2) = log(1/2) since log(1/x) = -log(x)
+        x: Horizontal offset in normalized source coords.
+        y: Vertical offset in normalized source coords.
     """
+    def __init__(self, log_scale: torch.Tensor, x: torch.Tensor, y: torch.Tensor):
+        assert log_scale.shape == x.shape == y.shape, f"log_scale/x/y shape mismatch: {log_scale.shape}, {x.shape}, {y.shape}"
+        
+        # The class attributes
+        self.log_scale = log_scale
+        self.x = x
+        self.y = y
+        
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    zoom: float | torch.Tensor = 0.0
-    tx: float | torch.Tensor = 0.0
-    ty: float | torch.Tensor = 0.0
-
-    def to_batched(self, B: int, device, dtype) -> "Action":
-        """Materialize all fields as ``(B,)`` tensors on the given device/dtype.
-
-        Args:
-            B: Batch size to broadcast scalar fields to.
-            device: Target device.
-            dtype: Target floating-point dtype.
-
-        Returns:
-            A new ``Action`` whose fields are all ``(B,)`` tensors.
-        """
-
-        def b(v):
-            # tensor: just move; 0-d tensors expand to (B,)
-            if isinstance(v, torch.Tensor):
-                t = v.to(device=device, dtype=dtype)
-                if t.dim() == 0:
-                    t = t.expand(B)
-                return t
-            # scalar -> filled (B,) tensor
-            return torch.full((B,), float(v), device=device, dtype=dtype)
-
-        return Action(zoom=b(self.zoom), tx=b(self.tx), ty=b(self.ty))
-
-    def __add__(self, other: "Action") -> "Action":
-        """Component-wise sum of two actions (used to accumulate state)."""
-        return Action(
-            zoom=self.zoom + other.zoom,
-            tx=self.tx + other.tx,
-            ty=self.ty + other.ty,
-        )
-
-
-class GlimpseTransform:
-    """Stateful, batched zoom + translate transform.
-
-    Stores a source batch and a cumulative ``Action`` state. Each call to
-    ``transform`` applies a *delta* on top of the current state and renders
-    the resulting view at the source resolution. The whole batch is processed
-    in a single ``affine_grid`` + ``grid_sample`` op (one fused CUDA kernel).
-
-    Attributes:
-        init_bounds: Half-widths of the uniform sampling ranges used by
-            ``initialize_batch``. Each field gives the symmetric range
-            ``[-field, +field]`` for that parameter.
-        device: Optional device to move stored batches onto.
-        mode: ``grid_sample`` interpolation mode (default ``"bilinear"``).
-        padding_mode: ``grid_sample`` padding mode for samples that fall
-            outside the source canvas (default ``"border"`` — replicates the
-            edge pixel, which is what we want for zoom-out).
-        align_corners: Forwarded to ``affine_grid`` / ``grid_sample``.
+class Glimpse:
     """
-
+    Absolute glimpse state RELATIVE to the original image.
+    
+    Glimpse history is aligned by t as follows:
+    #   glimpse_states[t] -> state BEFORE action t (log_scale, x, y)
+    #   glimpse_actions[t] -> action applied at step t (log_scale, dx, dy)
+    glimpse_staetes does not include current state (most recent state after applying an action at time t)
+    
+    log_scale:
+        0.0 means original image scale.
+        2.0 means zoomed in e²≈7.39x
+        -2.0 means zoomed out e²≈7.39x
+    """
     def __init__(
         self,
-        init_bounds: Action | None = None,
-        device: torch.device | None = None,
-        mode: str = "bilinear",
-        padding_mode: str = "border",
-        align_corners: bool = False,
+        image_batch: torch.Tensor, # Original images of shape (B, H, W) or (B, H, W, C). PS: Latter isn't currently supported 
+        log_scale: torch.Tensor = torch.Tensor([0]), # Has to be of shape (B, 1) or (1). Initial scale of images.
+        x: torch.Tensor = torch.Tensor([0]), # Has to be of shape (B, 1) or (1). Initial x-coords of images.
+        y: torch.Tensor = torch.Tensor([0]), # Has to be of shape (B, 1) or (1). Initial y-coords of images.
+        T_max: int = 16, # Max trajectory length stored in history buffers.
     ):
-        # default bounds: ±0.3 log-zoom (~0.74x to ~1.35x), ±0.5 translation
-        self.init_bounds = (
-            init_bounds if init_bounds is not None else Action(zoom=1, tx=1, ty=1)
-        )
-        self.device = device
-        self.mode = mode
-        self.padding_mode = padding_mode
-        self.align_corners = align_corners
 
-        # source batch (B, C, H, W) — set via set_batch / initialize_batch
-        self._batch: torch.Tensor | None = None
-        # cumulative per-sample state; fields are (B,) tensors
-        self._state: Action | None = None
-
-    def set_batch(self, x: torch.Tensor) -> "GlimpseTransform":
-        """Store a fresh source batch and reset state to identity.
-
-        Args:
-            x: Source images of shape ``(B, C, H, W)``.
-
-        Returns:
-            ``self``, to allow chaining.
+        # 1. Getting Batch size        
+        self.B = B = image_batch.shape[0]
+        
+        # 2. Expanding scale, x and y if not correct shape
+        if log_scale.shape[0] != B:
+            log_scale = log_scale.expand((B, 1))
+        if x.shape[0] != B:
+            x = x.expand((B, 1))
+        if y.shape[0] != B:
+            y = y.expand((B, 1))
+        
+        # 3. Preallocated trajectory buffers, aligned by step t:
+        self.glimpse_states = log_scale.new_zeros(T_max, B, 3)
+        self.glimpse_actions = log_scale.new_zeros(T_max, B, 3)
+        
+        # 4. Defining vars
+        self.log_scale = log_scale
+        self.x = x
+        self.y = y
+        self.T_max = T_max # Max trajectories
+        self.t = 0 # initial time
+        self.image_batch = image_batch
+        self.original_image_batch = image_batch
+        
+        
+    def initialize_images(self):
         """
-        if x.dim() != 4:
-            raise ValueError(f"expected (B, C, H, W), got shape {tuple(x.shape)}")
-        # save the source; reset accumulated state since this is a new batch
-        self._batch = x.to(self.device) if self.device is not None else x
-        self.reset_state()
-        return self
-
-    def reset_state(self) -> None:
-        """Zero the cumulative action state (next render shows the source as-is)."""
-        x = self.batch
-        B = x.shape[0]
-        zeros = torch.zeros(B, device=x.device, dtype=x.dtype)
-        # separate clones so future in-place ops on one field don't alias others
-        self._state = Action(zoom=zeros, tx=zeros.clone(), ty=zeros.clone())
-
-    def set_state(self, state: Action) -> None:
-        """Install a known cumulative action as the current state.
-
-        Each field of ``state`` must already be a ``(B,)`` tensor matching the
-        stored batch (use :meth:`Action.to_batched` to broadcast scalars).
-        Useful for initializing the transform from an externally-sampled
-        action (e.g. one returned by :class:`ActionGenerator`).
+        Initializes self.image_batch into random starting positions.
         """
-        x = self.batch
-        B = x.shape[0]
-        for name in ("zoom", "tx", "ty"):
-            t = getattr(state, name)
-            if not isinstance(t, torch.Tensor) or t.shape != (B,):
-                raise ValueError(
-                    f"state.{name} must be a tensor of shape ({B},); got "
-                    f"{type(t).__name__} {getattr(t, 'shape', None)}"
-                )
-        self._state = state
+        pass
+        
 
-    def initialize_batch(
-        self,
-        x: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> Action:
-        """Set state to a per-sample random action drawn from ``init_bounds``.
+    def apply(self, delta: GlimpseAction):
+        """Apply a delta action to current Glimpse state to get a new Glimpse state
+        and append current-state and the delta action to history.
 
-        Each field is sampled uniformly from ``[-bound, +bound]`` where
-        ``bound`` is the corresponding field of ``self.init_bounds``.
-
-        Args:
-            x: Optional fresh source batch. If given, ``set_batch(x)`` is
-                called first, otherwise the previously-stored batch is used.
-            generator: Optional ``torch.Generator`` for reproducible sampling.
-
-        Returns:
-            The sampled initial ``Action`` (also stored as ``self.state``).
+        History is a sliding FIFO of length T_max:
+            glimpse_states[0]  -> oldest stored state
+            glimpse_states[-1] -> most recent state (just appended)
+        Once full, each new step shifts the buffer left by one and overwrites
+        the last slot. ``self.t`` saturates at T_max (count of valid entries).
+        
+        Returns new state (in case we want to visualize it or use it).
         """
-        if x is not None:
-            self.set_batch(x)
-        b = self.batch
-        B = b.shape[0]
+        current_glimpse_state = torch.cat([self.log_scale, self.x, self.y], dim=-1) # (B, 3)
+        new_glimpse_action = torch.cat([delta.log_scale, delta.x, delta.y], dim=-1)  # (B, 3)
 
-        def sample(half_width):
-            # scalar bound -> uniform in [-hw, +hw]
-            hw = (
-                float(half_width)
-                if not isinstance(half_width, torch.Tensor)
-                else float(half_width.item())
-            )
-            u = torch.rand(B, device=b.device, dtype=b.dtype, generator=generator)
-            return (u * 2.0 - 1.0) * hw
-
-        # save the new initial action state
-        self._state = Action(
-            zoom=sample(self.init_bounds.zoom),
-            tx=sample(self.init_bounds.tx),
-            ty=sample(self.init_bounds.ty),
-        )
-        return self._state
-
-    @property
-    def batch(self) -> torch.Tensor:
-        """The currently stored source batch."""
-        if self._batch is None:
-            raise RuntimeError("call set_batch() or initialize_batch() first")
-        return self._batch
-
-    @property
-    def state(self) -> Action:
-        """The current cumulative action (per-sample tensors of shape ``(B,)``)."""
-        if self._state is None:
-            raise RuntimeError("no state; call set_batch() or initialize_batch() first")
-        return self._state
-
-    def transform(self, delta: Action) -> torch.Tensor:
-        """Accumulate ``delta`` into state and render the resulting view.
-
-        The new state is ``self.state + delta``. The rendered view samples
-        the source via an inverse affine map built from the new state:
-        scale ``= exp(state.zoom)`` along both axes, then translation by
-        ``(state.tx, state.ty)`` in normalized source coords.
-
-        Args:
-            delta: Per-sample delta to apply on top of the current state.
-                Scalar fields broadcast across the batch; tensor fields must
-                be shape ``(B,)`` (or 0-d, which also broadcasts).
-
-        Returns:
-            View tensor of shape ``(B, C, H, W)`` — same resolution as the
-            source.
-        """
-        x = self.batch
-        B = x.shape[0]
-
-        # broadcast / move the delta onto the batch device/dtype
-        delta_b = delta.to_batched(B, device=x.device, dtype=x.dtype)
-        for name, t in (("zoom", delta_b.zoom), ("tx", delta_b.tx), ("ty", delta_b.ty)):
-            assert isinstance(t, torch.Tensor)
-            if t.shape != (B,):
-                raise ValueError(
-                    f"delta.{name} must broadcast to ({B},), got {tuple(t.shape)}"
-                )
-
-        # accumulate: new_state = old_state + delta
-        self._state = self.state + delta_b
-
-        zoom = self._state.zoom
-        tx = self._state.tx
-        ty = self._state.ty
-        assert (
-            isinstance(zoom, torch.Tensor)
-            and isinstance(tx, torch.Tensor)
-            and isinstance(ty, torch.Tensor)
-        )
-
-        # affine_grid's theta maps OUTPUT coords -> INPUT coords, so the
-        # diagonal is the inverse of the visual scale: zoom-in (scale > 1)
-        # samples a smaller window of the source (1/scale < 1).
-        inv_scale = torch.exp(-zoom)
-        zero = torch.zeros_like(inv_scale)
-
-        # theta[b] = [[inv_scale, 0, tx],
-        #             [0, inv_scale, ty]]
-        theta = torch.stack(
-            [
-                torch.stack([inv_scale, zero, tx], dim=-1),
-                torch.stack([zero, inv_scale, ty], dim=-1),
-            ],
-            dim=-2,
-        )
-
-        # one fused kernel: build sampling grid + bilinear sample with border padding
-        grid = F.affine_grid(theta, size=x.shape, align_corners=self.align_corners)
-        return F.grid_sample(
-            x,
-            grid,
-            mode=self.mode,
-            padding_mode=self.padding_mode,
-            align_corners=self.align_corners,
-        )
-
-
-class ActionGenerator(ABC):
-    """Abstract trajectory schedule sampler for the glimpse environment.
-
-    Subclasses implement :meth:`sample`, which returns a triple
-    ``(init, deltas, t_stop)``:
-
-    - ``init`` (:class:`Action`): per-sample cumulative state at step 0; each
-      field is a ``(B,)`` tensor sampled uniform in
-      ``[-init_bounds.<axis>, +init_bounds.<axis>]``.
-    - ``deltas``: ``(B, T_max, 3)`` float tensor with column order
-      ``[zoom, tx, ty]``. Index ``k`` is the delta from cumulative state at
-      step ``k`` to step ``k+1``. For each sample ``b``, entries with
-      ``k >= t_stop[b]`` are zero (glimpse stays still for the remaining steps).
-    - ``t_stop``: ``(B,)`` long tensor, values in ``[1, T_max]``, sampled
-      uniform integer per sample. Number of non-zero deltas.
-
-    Args:
-        init_bounds: Half-widths of the symmetric uniform sampling ranges for
-            the initial action. Fields must be non-negative scalars or 0-d
-            tensors (negative bounds are meaningless under uniform-symmetric
-            sampling; per-sample bounds are not supported).
-        T_max: Maximum trajectory length (number of deltas). Must be ``>= 1``.
-    """
-
-    def __init__(self, init_bounds: Action, T_max: int):
-        if T_max < 1:
-            raise ValueError(f"T_max must be >= 1, got {T_max}")
-        for name in ("zoom", "tx", "ty"):
-            self._check_bound(getattr(init_bounds, name), f"init_bounds.{name}")
-        self.init_bounds = init_bounds
-        self.T_max = T_max
-
-    @staticmethod
-    def _check_bound(v, name: str) -> None:
-        if isinstance(v, torch.Tensor):
-            if v.dim() != 0:
-                raise ValueError(f"{name} must be scalar or 0-d tensor, got shape {tuple(v.shape)}")
-            f = float(v.item())
+        if self.t < self.T_max:
+            # Buffer not yet full: write at next free slot
+            self.glimpse_states[self.t]  = current_glimpse_state
+            self.glimpse_actions[self.t] = new_glimpse_action
+            self.t += 1
+            
         else:
-            f = float(v)
-        if f < 0:
-            raise ValueError(f"{name} must be non-negative, got {f}")
+            # Buffer full: drop oldest, append newest at the end
+            self.glimpse_states  = torch.roll(self.glimpse_states,  shifts=-1, dims=0)
+            self.glimpse_actions = torch.roll(self.glimpse_actions, shifts=-1, dims=0)
+            self.glimpse_states[-1]  = current_glimpse_state
+            self.glimpse_actions[-1] = new_glimpse_action
 
-    def _sample_init(
-        self,
-        B: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        generator: torch.Generator | None,
-    ) -> Action:
-        """Sample a per-sample initial action uniform in ``±init_bounds``."""
-
-        def sample(half_width):
-            hw = (
-                float(half_width.item())
-                if isinstance(half_width, torch.Tensor)
-                else float(half_width)
-            )
-            u = torch.rand(B, device=device, dtype=dtype, generator=generator)
-            return (u * 2.0 - 1.0) * hw
-
-        return Action(
-            zoom=sample(self.init_bounds.zoom),
-            tx=sample(self.init_bounds.tx),
-            ty=sample(self.init_bounds.ty),
-        )
-
-    def _sample_t_stop(
-        self,
-        B: int,
-        device: torch.device,
-        generator: torch.Generator | None,
-    ) -> torch.Tensor:
-        """Sample ``t_stop ~ U{1, ..., T_max}`` per sample as a long tensor."""
-        return torch.randint(
-            low=1,
-            high=self.T_max + 1,
-            size=(B,),
-            device=device,
-            dtype=torch.long,
-            generator=generator,
-        )
-
-    @abstractmethod
-    def sample(
-        self,
-        B: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        generator: torch.Generator | None = None,
-    ) -> tuple[Action, torch.Tensor, torch.Tensor]:
-        """Return ``(init, deltas, t_stop)`` for a fresh batch of trajectories."""
-        raise NotImplementedError
+        # Update current absolute state
+        self.log_scale = self.log_scale + delta.log_scale
+        self.x = self.x + delta.x
+        self.y = self.y + delta.y
+        
+        new_glimpse_state = torch.cat([self.log_scale, self.x, self.y], dim=-1) # (B, 3)
+        return new_glimpse_state
 
 
-class RandomWalkGenerator(ActionGenerator):
-    """Random-walk trajectory schedule.
+    def transform(self, t: int = -1) -> torch.Tensor:
+        """
+        Render the image batch at glimpse state `t`.
+        
+        Args:
+            t: -1 for the current live state; otherwise an index into
+            `glimpse_states` in [0, self.t).
+        
+        Returns:
+            transformed_images: Transformed batch with the same layout 
+            as `self.image_batch`. Regions outside the source are zero-padded.
+        """
+        
+        # Getting most current state if t is -1
+        if t == -1:
+            log_scale = self.log_scale
+            x = self.x
+            y = self.y
+            
+        else:
+            assert 0 <= t < self.t, f"t={t} out of range [0, {self.t})"
+            state = self.glimpse_states[t]  # (B, 3): log_scale, x, y
+            log_scale = state[:, 0:1]
+            x = state[:, 1:2]
+            y = state[:, 2:3]
+            
+        scale = torch.exp(log_scale)
+        
+        # Get original image batch of this glimpse and handle different channel sizes
+        img = self.original_image_batch
+        orig_ndim = img.ndim
+        if orig_ndim == 3:  # (B, H, W) mono
+            img = img.unsqueeze(1)
+        elif orig_ndim == 4:  # (B, H, W, C)
+            img = img.permute(0, 3, 1, 2).contiguous()
+        else:
+            raise ValueError(f"expected (B,H,W) or (B,H,W,C), got {img.shape}")
+        
+        B, C, H, W = img.shape
+        inv_s = (1.0 / scale).squeeze(-1)  # (B,) - transformation matrix is 1/s
+        zero = inv_s.new_zeros(B) # rotation is 0 for now
+        
+        # Create the transformation matrix (scale and translation)
+        theta = torch.stack([
+            torch.stack([inv_s, zero,  x.squeeze(-1)], dim=-1),
+            torch.stack([zero,  inv_s, y.squeeze(-1)], dim=-1),
+        ], dim=1)  # (B, 2, 3)
+        
+        grid = F.affine_grid(theta, size=(B, C, H, W), align_corners=False)
+        transformed_images = F.grid_sample(img, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        
+        if orig_ndim == 3:
+            return transformed_images.squeeze(1)
+        return transformed_images.permute(0, 2, 3, 1).contiguous()
+    
+    
+def rollout(imgs, T_max=16, scale_sensitivity=0.2, translation_sensitivity=0.1, device="cuda"):
+    """Roll out a random glimpse trajectory.
 
-    For each sample ``b``, the trajectory is:
-    ``state_0 = init[b]`` then for ``k < t_stop[b]``,
-    ``deltas[b, k, axis] ~ U[-step_bounds.<axis>, +step_bounds.<axis>]``
-    independently per axis and step. For ``k >= t_stop[b]``, ``deltas`` is
-    zero (glimpse stays still). No clipping — cumulative state may drift
-    outside ``init_bounds``.
-
-    Edge cases:
-        * ``T_max = 1``: legal; ``t_stop`` is always 1, ``deltas`` is ``(B, 1, 3)``.
-        * ``init_bounds`` field is 0: that axis is always 0 in ``init`` but the
-          delta on that axis is unaffected (sampled from ``step_bounds``).
-        * ``step_bounds > init_bounds``: legal but unusual — random walk may
-          drift outside the init range.
-
-    Args:
-        init_bounds: See :class:`ActionGenerator`.
-        T_max: See :class:`ActionGenerator`.
-        step_bounds: Half-widths of the per-step uniform delta ranges. Must be
-            non-negative scalars or 0-d tensors. Defaults to
-            ``init_bounds / T_max`` so per-step delta magnitudes are
-            comparable to a return-to-origin schedule.
+    Returns:
+        seed:    (B, 1, 28, 28) initial centered frame to seed the autoregressive chain.
+        actions: (T_max, B, 3) per-step deltas.
+        input_frames: (T_max, B, 1, 28, 28) true frames at steps 0..T_max-1.
+        targets: (T_max, B, 1, 28, 28) true frames at steps 1..T_max.
     """
+    B = imgs.shape[0]
+    glimpse = Glimpse(
+        imgs,
+        log_scale=torch.zeros(B, 1, device=device),
+        x=torch.zeros(B, 1, device=device),
+        y=torch.zeros(B, 1, device=device),
+        T_max=T_max,
+    )
 
-    def __init__(
-        self,
-        init_bounds: Action,
-        T_max: int,
-        step_bounds: Action | None = None,
-    ):
-        super().__init__(init_bounds, T_max)
-        if step_bounds is None:
-            step_bounds = Action(
-                zoom=float(self._scalar(init_bounds.zoom)) / T_max,
-                tx=float(self._scalar(init_bounds.tx)) / T_max,
-                ty=float(self._scalar(init_bounds.ty)) / T_max,
-            )
-        for name in ("zoom", "tx", "ty"):
-            self._check_bound(getattr(step_bounds, name), f"step_bounds.{name}")
-        self.step_bounds = step_bounds
+    # Get random glimpse actions (Maybe this should be a method in glimpse action class?)
+    d_log_scale = torch.randn(T_max, B, 1, device=device) * scale_sensitivity
+    d_x = torch.randn(T_max, B, 1, device=device) * translation_sensitivity
+    d_y = torch.randn(T_max, B, 1, device=device) * translation_sensitivity
 
-    @staticmethod
-    def _scalar(v):
-        return float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+    # Apply actions to each frame
+    frames = [glimpse.transform(t=-1)] # Initial centered frame
+    for t in range(T_max):
+        glimpse.apply(GlimpseAction(d_log_scale[t], d_x[t], d_y[t]))
+        frames.append(glimpse.transform(t=-1))
+        
+    frames = torch.stack(frames, dim=1) # (B, T_max+1, 28, 28)
+    actions = torch.cat([d_log_scale, d_x, d_y], dim=-1).transpose(0, 1) # (B, T_max, 3)
 
-    def sample(self, B, device, dtype, generator=None):
-        init = self._sample_init(B, device, dtype, generator)
-        t_stop = self._sample_t_stop(B, device, generator)
+    seed         = frames[:, 0:1].unsqueeze(2)      # (B, 1, 1, 28, 28)
+    targets      = frames[:, 1:].unsqueeze(2)       # (B, T_max, 1, 28, 28)
+    input_frames = frames[:, :T_max].unsqueeze(2)   # (B, T_max, 1, 28, 28)
+    
+    return seed, actions, input_frames, targets
+    
+#================================================
+#                TESTING CODE
+#================================================
+if __name__ == "__main__":
+    import torchvision
+    from vis_utils import plot_glimpse_frames
+    import torchvision.transforms as T
 
-        # uniform deltas in [-bound, +bound] per axis, full (B, T_max) tensor
-        u = torch.rand(B, self.T_max, 3, device=device, dtype=dtype, generator=generator)
-        u = u * 2.0 - 1.0
-        bounds = torch.tensor(
-            [
-                self._scalar(self.step_bounds.zoom),
-                self._scalar(self.step_bounds.tx),
-                self._scalar(self.step_bounds.ty),
-            ],
-            device=device,
-            dtype=dtype,
-        )
-        deltas = u * bounds  # broadcast (B, T_max, 3) * (3,)
-
-        # zero out deltas at k >= t_stop[b]
-        k_idx = torch.arange(self.T_max, device=device).unsqueeze(0)  # (1, T_max)
-        active = (k_idx < t_stop.unsqueeze(1)).to(dtype)               # (B, T_max)
-        deltas = deltas * active.unsqueeze(-1)
-
-        return init, deltas, t_stop
+    # torch.manual_seed(8)
+    scale_sensitivity = 0.2
+    translation_sensitivity = 0.1
 
 
-class ReturnToOriginGenerator(ActionGenerator):
-    """Linear return-to-origin trajectory schedule.
+    # 1. Get MNIST batch of shape (B, 28, 28)
+    ds = torchvision.datasets.MNIST(root='./data', train=True,download=True, transform=T.ToTensor())
+    imgs, _ = next(iter(torch.utils.data.DataLoader(ds, batch_size=4, shuffle=True)))
+    imgs = imgs.squeeze(1) # (B, H, W)
+    B = imgs.shape[0]
 
-    For each sample ``b``, ``init[b]`` is sampled per the base class. The
-    constant per-step delta ``-init[b] / t_stop[b]`` is broadcast across
-    ``k = 0, ..., t_stop[b] - 1`` so the cumulative state at step
-    ``t_stop[b]`` is exactly the origin ``(0, 0, 0)``. For ``k >= t_stop[b]``
-    the delta is zero (already at origin).
+    # 2. Initial glimpse: scale=1, centered
+    T_max = 16
+    glimpse = Glimpse(imgs, log_scale=torch.zeros(B, 1), x=torch.zeros(B, 1), y=torch.zeros(B, 1), T_max=T_max)
 
-    Edge cases:
-        * ``T_max = 1``: legal; ``t_stop`` is always 1, the single delta is
-          ``-init`` (lands on origin in one step).
-        * ``t_stop = 1`` (any ``T_max``): single delta of ``-init``; falls out
-          of the ``-init / t_stop`` formula with no special case.
-        * ``init_bounds`` field is 0: that axis is always 0 in ``init``, so
-          the corresponding delta is also 0.
+    # 3. Random per-step deltas (small, so the trajectory is visible)
+    #    scale must be > 0; sample multiplicatively around 1
+    delta_scale = (torch.randn(T_max, B, 1)) * scale_sensitivity
+    delta_x = torch.randn(T_max, B, 1) * translation_sensitivity
+    delta_y = torch.randn(T_max, B, 1) * translation_sensitivity
 
-    Args:
-        init_bounds: See :class:`ActionGenerator`.
-        T_max: See :class:`ActionGenerator`.
-    """
+    # 4. Apply each delta for each state to get the transformed sequentiall transformer glimpses
+    # Render the resulting current state
+    frames = []
+    for t in range(T_max):
+        glimpse.apply(GlimpseAction(delta_scale[t], delta_x[t], delta_y[t]))
+        frames.append(glimpse.transform(t=-1).detach().cpu())  # (B, H, W)
 
-    def __init__(self, init_bounds: Action, T_max: int):
-        super().__init__(init_bounds, T_max)
+    # 5. Visualize: rows = batch item, cols = time step
+    plot_glimpse_frames(frames)
 
-    def _build_deltas(
-        self,
-        init: Action,
-        t_stop: torch.Tensor,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Construct ``(B, T_max, 3)`` deltas given a sampled init and t_stop."""
-        B = t_stop.shape[0]
-        init_stack = torch.stack([init.zoom, init.tx, init.ty], dim=-1)  # (B, 3)
-        per_step = -init_stack / t_stop.to(dtype).unsqueeze(-1)          # (B, 3)
-
-        # broadcast per_step across T_max, then zero out k >= t_stop
-        deltas = per_step.unsqueeze(1).expand(B, self.T_max, 3).clone()  # (B, T_max, 3)
-        k_idx = torch.arange(self.T_max, device=device).unsqueeze(0)     # (1, T_max)
-        active = (k_idx < t_stop.unsqueeze(1)).to(dtype).unsqueeze(-1)   # (B, T_max, 1)
-        return deltas * active
-
-    def sample(self, B, device, dtype, generator=None):
-        init = self._sample_init(B, device, dtype, generator)
-        t_stop = self._sample_t_stop(B, device, generator)
-        deltas = self._build_deltas(init, t_stop, device, dtype)
-        return init, deltas, t_stop

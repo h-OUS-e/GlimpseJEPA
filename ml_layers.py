@@ -1,0 +1,524 @@
+"""
+For now, All models take:
+- image of shape (B, 1, 28, 28)
+- action of shape (B, 3) where action = (log_scale, dx, dy)
+and output:
+- next_image of shape (B, 1, 28, 28)
+"""
+
+import torch
+import torch.nn as nn
+from einops import rearrange
+import torch.nn.functional as F
+
+
+#================================================
+#                SIMPLE MLP
+#================================================
+class SimpleMLP(nn.Module):
+    """MLP that predicts the next glimpse image from (image, action).
+
+    Args:
+        img_hw: Spatial size of the (square) input image.
+        action_dim: Size of the action vector (log_scale, dx, dy -> 3).
+        hidden_dim: Width of the hidden Linear layers.
+    """
+    def __init__(self, img_hw: int = 28, action_dim: int = 3, hidden_dim: int = 512):
+        super().__init__()
+        self.img_hw = img_hw
+        self.img_dim = img_hw * img_hw
+
+        self.net = nn.Sequential(
+            nn.Linear(self.img_dim + action_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, self.img_dim),
+            nn.Sigmoid(), # Final activation (sigmoid) so pixel values stay in [0, 1].
+        )
+
+    def forward(self, images, actions):
+        """
+        Args:
+            images: (B, T, C, H, W)
+            actions: (B, T, A)
+        """
+        B = images.size(0)
+        T = images.size(1)
+        # x = images.view(B, T, self.img_dim) # Flatten the input image to a vector of size 28*28 = 784.
+        images_flat = rearrange(images, "b t c h w -> b t (c h w)") # Flatten the input image to a vector of size 1*28*28 = 784.
+        
+        # Run through mlp model, auto-regressively
+        preds = []
+        x = images_flat[:, 0] # the seed image
+        for t in range(T):
+            x = torch.cat([x, actions[:, t]], dim=-1) #  Concatenate with the action vector of size 3, giving an input of size 787.
+            x = self.net(x) # (B, 1, 28, 28)
+            preds.append(x.view(B, 1, self.img_hw, self.img_hw))
+        
+        # Change from list to torch tensor of shape (B, T, C, H, W)
+        out = torch.stack(preds, dim=1)
+        
+        # We return all predictions for visualization. We only calc loss for last pred though.
+        return out
+
+
+
+#================================================
+#                SIMPLE CNN
+#================================================
+class SimpleCNN(nn.Module):
+    """CNN that predicts the next glimpse image from (image, action).
+
+    Args:
+        img_hw: Spatial size of the (square) input image. Must be divisible by 4.
+        action_dim: Size of the action vector (log_scale, dx, dy -> 3).
+        base_channels: Channels of the first conv layer (doubled at each downsample).
+        hidden_dim: Width of the fused feature vector that conditions the decoder.
+    """
+    def __init__(self, img_hw: int = 28, action_dim: int = 3, base_channels: int = 32, hidden_dim: int = 256):
+        super().__init__()
+        assert img_hw % 4 == 0, f"img_hw must be divisible by 4, got {img_hw}"
+        self.img_hw = img_hw
+        self.feat_hw = img_hw // 4 # Two stride-2 downsamples
+        self.feat_c  = base_channels * 2
+        self.feat_dim = self.feat_c * self.feat_hw * self.feat_hw
+
+        # Encoder: 28 -> 14 -> 7
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, base_channels, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.to_feat   = nn.Linear(self.feat_dim, hidden_dim)
+        self.action_fc = nn.Linear(action_dim, hidden_dim)
+        self.from_feat = nn.Linear(hidden_dim, self.feat_dim)
+
+        # Decoder: 7 -> 14 -> 28
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(base_channels, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, image: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        B = image.shape[0]
+
+        # Encode image to a feature vector
+        h = self.encoder(image) # (B, 2C, H/4, W/4)
+        h = h.view(B, self.feat_dim)
+        img_feat = self.to_feat(h) # (B, hidden_dim)
+
+        # Fuse with action by addition
+        a_feat = self.action_fc(action) # (B, hidden_dim)
+        fused = img_feat + a_feat
+
+        # Decode back to image
+        h = self.from_feat(fused).view(B, self.feat_c, self.feat_hw, self.feat_hw)
+        out = self.decoder(h)
+        return out
+
+
+#================================================
+#       VAE (CNN or MLP encoder/decoder)
+#================================================
+# Constructor takes a flag (e.g. backbone="cnn" or "mlp") to pick which encoder/decoder to use.
+#
+# Encoder:
+# 1. If backbone is CNN, use the Simple CNN encoder stack to map image to a feature vector of size D.
+# 2. If backbone is MLP, flatten the image and pass through Linear + ReLU layers to a feature vector of size D.
+# 3. From that feature vector, two Linear heads produce mu (B, Z) and logvar (B, Z).
+#
+# Reparameterization:
+# 1. Sample epsilon from a standard normal of shape (B, Z).
+# 2. Compute z = mu + exp(0.5 * logvar) * epsilon.
+#
+# Action conditioning:
+# 1. Project action (B, 3) through a small Linear layer to size Z (or some action embedding size).
+# 2. Concatenate z and the action embedding into a vector of size Z + Z_action.
+#
+# Decoder:
+# 1. If backbone is CNN, Linear from (Z + Z_action) up to C*H'*W', reshape, then ConvTranspose2d + ReLU stack back to (B, 1, 28, 28).
+# 2. If backbone is MLP, Linear + ReLU layers from (Z + Z_action) up to 784 and reshape to (B, 1, 28, 28).
+# 3. Final sigmoid so pixel values stay in [0, 1].
+#
+# Forward returns: predicted next_image, mu, logvar (so the train loop can compute reconstruction loss + KL divergence).
+
+
+#================================================
+#         My Custom LeWorldModel Modules
+#================================================
+class DeepMLP(nn.Module):
+    """A simple MLP whose depth can be customized"""
+    def __init__(self, input_dim, hidden_dim, output_dim, depth):
+        super().__init__()
+        
+        # defining simple mlp blocks
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LeakyReLU()]
+        
+        # Building our deep net
+        for i in range(depth -1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU()]
+        layers += [nn.Linear(hidden_dim, output_dim)] # last layer
+        self.net = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.net(x)
+        
+
+class ARPredictorSimple(nn.Module):
+    """
+    A Simple Auto-regressive predictor. Given action and current glimpse
+    it outputs next expected glimpse.
+    
+    Uses a simple MLP instead of transformer.
+    """
+    def __init__(self, z_dim_img, z_dim_action, hidden_dim=512, depth=3):
+        super().__init__()
+
+        self.net = DeepMLP(z_dim_img + z_dim_action, hidden_dim, z_dim_img, depth=depth)
+
+    def forward(self, z_img, z_action, ar_steps=0):
+        """
+        ar_steps=0  → teacher forcing (parallel, fast, stable)
+        ar_steps=K  → first K steps are autoregressive, rest teacher-forced
+        ar_steps=T  → full AR (what you have now)
+        """
+        B, T, _ = z_img.size()
+        if ar_steps <= 0:
+            # teacher-forced path (not autoregressive)
+            x = torch.cat([z_img, z_action], dim=-1)
+            return self.net(x)
+
+        # mixed: AR for the first ar_steps, then teacher-forced for the rest
+        z_preds = []
+        x = z_img[:, 0:1]
+        for t in range(ar_steps):
+            x = torch.cat([x, z_action[:, t:t+1]], dim=-1)
+            x = self.net(x)
+            z_preds.append(x)
+            
+        # remaining steps teacher-forced (parallel)
+        if ar_steps < T:
+            tail = torch.cat([z_img[:, ar_steps:], z_action[:, ar_steps:]], dim=-1)
+            z_preds.append(self.net(tail))
+            
+        return torch.cat(z_preds, dim=1)
+
+        
+
+class ARPredictorSimpleAdaLN(nn.Module):
+    """Like ARPredictorSimple, but uses Adaptive Layer Normalization or FiLM"""
+    def __init__(self, z_dim, a_dim, hidden_dim=512):
+        super().__init__()
+        self.up = nn.Linear(z_dim, hidden_dim)
+        self.film = nn.Linear(a_dim, 2 * hidden_dim)   # zero-init for stability:
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        self.down = nn.Linear(hidden_dim, z_dim)
+
+    def forward(self, z_img, z_action):
+        h = self.up(z_img)
+        gamma, beta = self.film(z_action).chunk(2, dim=-1)
+        h = h * (1 + gamma) + beta
+        return self.down(h)
+        
+
+class ImageEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, z_dim, depth=3):
+        super().__init__()
+        
+        self.encoder = DeepMLP(input_dim, hidden_dim, z_dim, depth=depth)
+
+    def forward(self, images):
+        """
+        Args:
+            images: (B*T, C, H, W)
+        """
+        images = rearrange(images, "b c h w -> b (c h w)")
+        z_img = self.encoder(images)
+        return z_img
+    
+class Decoder(nn.Module):
+    """MLP decoder: z -> (1, H, W). Makes JEPA latents visualizable."""
+    def __init__(self, z_dim, hidden_dim=512, h=28, w=28, depth=2):
+        super().__init__()
+        self.h = h
+        self.w = w
+        layers = [nn.Linear(z_dim, hidden_dim), nn.ReLU(inplace=True)]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]
+        layers += [nn.Linear(hidden_dim, h * w), nn.Sigmoid()]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z):
+        # z: (..., D) -> (..., 1, H, W)
+        x = self.net(z)
+        return x.view(*z.shape[:-1], 1, self.h, self.w)
+
+#================================================
+#     ViT and JEPA modules from LeWorldModel
+#================================================
+
+class MLP_Projector(nn.Module):
+    """Simple MLP with optional normalization and activation"""
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        norm_fn=nn.LayerNorm,
+        act_fn=nn.GELU,
+    ):
+        super().__init__()
+        norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            norm_fn,
+            act_fn(),
+            nn.Linear(hidden_dim, output_dim or input_dim),
+        )
+
+    def forward(self, x):
+        """
+        x: (B*T, D)
+        """
+        return self.net(x)
+    
+    
+class FeedForward(nn.Module):
+    """FeedForward network used in Transformers"""
+
+    def __init__(self, dim, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    """Scaled dot-product attention with causal masking"""
+
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.heads = heads
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(self, x, causal=True):
+        """
+        x : (B, T, D)
+        """
+        x = self.norm(x)
+        drop = self.dropout if self.training else 0.0
+        qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
+        q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = rearrange(out, "b h t d -> b t (h d)")
+        return self.to_out(out)
+    
+class Block(nn.Module):
+    """Standard Transformer block"""
+
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+        super().__init__()
+
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+    
+class Transformer(nn.Module):
+    """Standard Transformer with support for AdaLN-zero blocks"""
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        depth,
+        heads,
+        dim_head,
+        mlp_dim,
+        dropout=0.0,
+        block_class=Block,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.layers = nn.ModuleList([])
+
+        # If input dim  to predictor is different from the transformer's hidden_dim
+        # we need to project input into the right dim hidden dimension size
+        self.input_proj = (
+            nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim
+            else nn.Identity()
+        )
+
+        # "condition" projector is for action
+        self.cond_proj = (
+            nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim
+            else nn.Identity()
+        )
+
+        # If output dim from predictor is different specified dim of 
+        # the latent vector we expect to compare it to (here it is the output_dim)
+        # then we need to create a projector too. 
+        
+        self.output_proj = (
+            nn.Linear(hidden_dim, output_dim)
+            if hidden_dim != output_dim
+            else nn.Identity()
+        )
+
+        for _ in range(depth):
+            self.layers.append(
+                block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
+            )
+
+    def forward(self, x, c=None):
+
+        if hasattr(self, "input_proj"):
+            x = self.input_proj(x)
+
+        if c is not None and hasattr(self, "cond_proj"):
+            c = self.cond_proj(c)
+
+        for block in self.layers:
+            # If block layer is of class 'Block', it can only accept one input x
+            # If it is of type 'ConditionalBlock', it takes x and c (c is condition or action in this case)
+            x = block(x) if isinstance(block, Block) else block(x, c)
+        x = self.norm(x)
+
+        if hasattr(self, "output_proj"):
+            x = self.output_proj(x)
+        return x
+    
+    
+def modulate(x, shift, scale):
+    """AdaLN-zero modulation"""
+    return x * (1 + scale) + shift
+
+
+class ConditionalBlock(nn.Module):
+    """
+    Transformer block with AdaLN-zero conditioning.    
+    AdaLN stands for Adaptive Layer Normalization.    
+    """
+
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+        super().__init__()
+
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+    
+    
+class ARPredictor(nn.Module):
+    """Autoregressive predictor for next-step embedding prediction."""
+
+    def __init__(
+        self,
+        *,
+        num_frames,
+        depth,
+        heads,
+        mlp_dim,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        dim_head=64,
+        dropout=0.0,
+        emb_dropout=0.0,
+    ):
+        super().__init__()
+        # TODO: replace with RoPE?
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(
+            input_dim,
+            hidden_dim,
+            output_dim or input_dim,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim,
+            dropout,
+            block_class=ConditionalBlock,
+        )
+
+    def forward(self, x, c):
+        """
+        x: (B, T, d)
+        c: (B, T, act_dim)
+        """
+        T = x.size(1)
+        x = x + self.pos_embedding[:, :T]
+        x = self.dropout(x)
+        x = self.transformer(x, c)
+        return x
+    
+    
+class ActionEncoder(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        smoothed_dim=None,
+        emb_dim=10,
+        mlp_scale=4,
+    ):
+        super().__init__()
+        in_dim = smoothed_dim or input_dim
+        self.patch_embed = nn.Linear(input_dim, smoothed_dim) if smoothed_dim else nn.Identity()
+        self.embed = nn.Sequential(
+            nn.Linear(in_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        )
+        
+    def forward(self, x):
+        """
+        x: (B, T, D)
+        """
+        x = self.patch_embed(x)
+        x = self.embed(x)
+        return x

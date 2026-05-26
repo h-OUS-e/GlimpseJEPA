@@ -219,6 +219,17 @@ __marimo__/
 
 # Datasets
 dataset/MNIST/
+data/*
 
 # Test artifacts (visual sanity plots)
 test_scripts/*.png
+
+wandb/*
+wandb/
+*/wandb
+*/wandb/*
+
+# Reference
+LeWorldModelRef/
+docs/
+.vscode/

@@ -22,16 +22,18 @@ class SIGReg(torch.nn.Module):
         super().__init__()
         self.num_proj = num_proj
         
+        # 2. Integration Points
         # Setup the integration grid (generate knots equally spaced sample points in surface domain [0, 3])
         t = torch.linspace(0, 3, knots, dtype=torch.float32)
-        dt = 3 / (knots - 1)
+        dt = 3 / (knots - 1)        
         
+        # 3. Theoretical Gaussian CF, the Gaussian weighting function w(t)
+        window = torch.exp(-0.5 * t**2)
         
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
         weights[[0, -1]] = dt
         
-        # the Gaussian weighting function w(t)
-        window = torch.exp(-t.square() / 2.0)
+   
         
         # Attach tensors to the SigReg class with the right device using register_buffer()
         self.register_buffer("t", t)
@@ -50,10 +52,14 @@ class SIGReg(torch.nn.Module):
         """
         # sample random projections
         D = z.size(-1) # size of latent vector
-        A = torch.randn(D, self.num_proj, device=z.device)
-        A = A.div_(A.norm(p=2, dim=0))
         
-        # compute the epps-pulley statistic
+        # 1. Projection (The Observer)
+        # Project channels down to sketch_dim
+        A = torch.randn(D, self.num_proj, device=z.device)
+        A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-6)
+        
+        # 4. Empirical CF, compute the epps-pulley statistic
+        # proj: [N, sketch_dim] 
         x_t = (z @ A).unsqueeze(-1) * self.t
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * z.size(-2)

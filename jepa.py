@@ -11,7 +11,10 @@ def detach_clone(v):
 
 
 class SIGReg(torch.nn.Module):
-    """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
+    """
+    Sketch Isotropic Gaussian Regularizer
+    Good vis about sigreg: https://the-puzzler.github.io/?p=practical-notes-on-lejepa
+    """
 
     def __init__(self, knots: int = 17, num_proj: int = 512):
         """
@@ -60,10 +63,10 @@ class SIGReg(torch.nn.Module):
         
         # 4. Empirical CF, compute the epps-pulley statistic
         # proj: [N, sketch_dim] 
-        x_t = (z @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * z.size(-2)
-        return statistic.mean() # average over projections and time
+        x_t = (z @ A).unsqueeze(-1) * self.t # (T, B, num_proj, num_t)
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square() # (T, num_proj, knots)
+        statistic = (err @ self.weights) * z.size(-2) # (T, num_proj)
+        return statistic.mean() # average over projections and time (a scalar)
     
 
 class JEPA(nn.Module):
@@ -126,18 +129,72 @@ class JEPA(nn.Module):
         
         return z_img, z_action
     
+    # def predict(self, z_img, z_action, ar_steps=0):
+    #     """
+    #     Predict next state embedding.
+    #     Args:
+    #         z_img: (B, T, D)
+    #         z_action: (B, T, A_embedding)
+    #     """
+    #     preds = self.predictor(z_img, z_action)
+    #     preds = self.projector_pred(rearrange(preds, "b t d -> (b t) d"))
+    #     preds = rearrange(preds, "(b t) d -> b t d", b=z_img.size(0)) # unflatten
+    #     return preds
     
     def predict(self, z_img, z_action, ar_steps=0):
         """
-        Predict next state embedding.
+        Predict next state embeddings.
+
+        ar_steps=0   -> teacher forcing (parallel pass over ground-truth z_img)
+        ar_steps=K   -> first K steps autoregressive, remaining teacher-forced
+        ar_steps>=T  -> full autoregressive rollout (no teacher forcing; use at eval)
+
+        Each AR step projects the predictor output back into z_img space via
+        projector_pred before feeding it back, so the fed-back state matches the
+        space of the encoder's embeddings (and of z_target in the loss).
+
         Args:
             z_img: (B, T, D)
             z_action: (B, T, A_embedding)
         """
-        preds = self.predictor(z_img, z_action, ar_steps=ar_steps)
+        T = z_img.size(1)
+
+        # Option A: Teacher forcing: single parallel pass over the true embeddings
+        if not ar_steps or ar_steps==0:
+            z_preds = self.predictor(z_img, z_action)
+            z_preds = self.project(z_preds)
+            return z_preds
+
+        # Option B: No teacher forcing up until AR_steps
+        ar_steps = min(ar_steps, T)
+        z_in = z_img[:, :1] # true first frame as the seed
+        preds = []
+        for t in range(ar_steps):
+            raw = self.predictor(z_in, z_action[:, :t + 1])[:, -1:] # predict frame t+1
+            pred = self.project(raw)
+            preds.append(pred)
+            z_in = torch.cat([z_in, pred], dim=1) # feed prediction back as next input
+        preds = torch.cat(preds, dim=1) # (B, ar_steps, D)
+
+        if ar_steps >= T:
+            return preds
+
+        # Tail: teacher-forced on the remaining true frames, conditioned on the AR prefix
+        z_full = torch.cat([z_in, z_img[:, ar_steps + 1:]], dim=1) # length T
+        tail = self.project(self.predictor(z_full, z_action)[:, ar_steps:])
+        return torch.cat([preds, tail], dim=1)
+
+    def project(self, preds):
+        """
+        Map predictor outputs (B, t, d) back into z_img space via projector_pred.
+        This is mainly for transformer architecture to avoid layer normalization
+        effect on SigReg. Layer normalization doesn't allow us to project embeddings
+        into a gaussian-like distribution effectively according to the paper.   
+        More about this can be found here: https://the-puzzler.github.io/?p=practical-notes-on-lejepa     
+        """
+        B = preds.size(0)
         preds = self.projector_pred(rearrange(preds, "b t d -> (b t) d"))
-        preds = rearrange(preds, "(b t) d -> b t d", b=z_img.size(0)) # unflatten
-        return preds
+        return rearrange(preds, "(b t) d -> b t d", b=B) # unflatten
     
     def decode(self, z_img):
         """z_img: (B, T, D) -> (B, T, 1, H, W)."""
@@ -187,7 +244,30 @@ class JEPA(nn.Module):
         else: 
             loss = F.mse_loss(z_pred, z_target.detach(), reduction="none")
             loss = einops.reduce(loss, "b ... -> b", "sum") # (B,) sum loss on all state, per batch
+            loss = loss.mean()
 
+        return loss
+    
+    
+    def mse_weighted(self, z_pred, z_target, mean=None):
+        """
+        Compute cost between predicted and target embeddings for
+        each state.
+        
+        Args:
+            z_pred: (B, T, D)
+            z_target: (B, T, D)
+        """      
+        B, T, D = z_pred.size() 
+        
+        # return loss for each action candidate
+        loss = F.mse_loss(z_pred, z_target.detach(), reduction="none")
+        loss = einops.reduce(loss, "... t d -> ... t", "sum") # (B, T) sum loss per state
+        weights = 1-(torch.arange(T))/T
+        weights = weights.expand(B, T).to(loss.device)
+        loss = einops.reduce(loss*weights, "... t -> ... ", "sum") # (B, ) sum weighted loss across states
+        loss = loss.mean() # average over batch to get scalar for backprop
+        
         return loss
     
     

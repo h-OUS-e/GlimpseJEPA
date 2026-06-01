@@ -9,28 +9,31 @@ import torch.nn.functional as F
 import torchvision
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from einops import rearrange
 import matplotlib.pyplot as plt
+import wandb
 
 from glimpse import rollout
 from jepa import JEPA
-from ml_layers import ARPredictorSimple, ActionEncoder, ImageEncoder, Decoder
+from ml_layers import ARPredictor, ActionEncoder, ImageEncoder, Decoder, MLP_Projector
 from vis_utils import plot_glimpse_frames
 
 
 #================================================
+
 #                GLOBAL VARS
 #================================================
 scale_sensitivity = 0.2
 translation_sensitivity = 0.1
 batch_size = 64
-T_max = 16
-lr = 1e-3
+T_max = 10
+lr = 4e-4
 epochs = 20
 viz_every = 1
-lambd = 0.01 # sigreg loss coefficient
-lambd_recon = 0.01
+lambd = 0.09 # sigreg loss coefficient
+lambd_recon = 0.1
+ar_steps = 0 # Teacher-forcing
 
 # model params
 input_dim_action = 3 # log_scale, x, y are only 3 parameters
@@ -38,9 +41,9 @@ hidden_dim_img_encoder = 512
 hidden_dim_predictor = 512
 decoder_hidden_dim = 512
 z_dim_img = 36
-z_dim_action = 9
+z_dim_action = 3
 depth_img_encoder = 3
-depth_predictor = 3
+depth_predictor = 2
 
 
 # Get device
@@ -75,10 +78,14 @@ else:
 # 1. Define JEPA & its model parts
 image_encoder = ImageEncoder(H*W, hidden_dim_img_encoder, z_dim_img, depth=depth_img_encoder)
 action_encoder = ActionEncoder(input_dim_action, emb_dim=z_dim_action)
-predictor = ARPredictorSimple(z_dim_img, z_dim_action, hidden_dim_predictor, depth_predictor)
+
+# predictor = ARPredictorSimpleAdaLN(z_dim_img, z_dim_action, hidden_dim_predictor)
+# predictor = ARPredictorSimple(z_dim_img, z_dim_action, hidden_dim_predictor, depth=depth_predictor)
+predictor = ARPredictor(num_frames=T_max, depth=4, heads=4, mlp_dim=512, input_dim=z_dim_img, hidden_dim=hidden_dim_predictor, output_dim=hidden_dim_predictor, action_dim=z_dim_action)
+projector_pred = MLP_Projector(input_dim=hidden_dim_predictor, output_dim=z_dim_img, hidden_dim=256, norm_fn=torch.nn.BatchNorm1d)
 decoder = Decoder(z_dim=z_dim_img, hidden_dim=decoder_hidden_dim, h=H, w=W, depth=2)
 
-model = JEPA(image_encoder, predictor, action_encoder, decoder=decoder)
+model = JEPA(image_encoder, predictor, action_encoder, decoder=decoder, projector_pred=projector_pred)
 
 # 2. Move the model to the right device (cuda if available, else cpu).
 model = model.to(device)
@@ -91,19 +98,35 @@ loss_fn = nn.MSELoss()
 
 
 #================================================
+#                WANDB INIT
+#================================================
+wandb.init(
+    project="glimpse-jepa",
+    config={
+        "scale_sensitivity": scale_sensitivity,
+        "translation_sensitivity": translation_sensitivity,
+        "batch_size": batch_size,
+        "T_max": T_max,
+        "lr": lr,
+        "epochs": epochs,
+        "lambd_sigreg": lambd,
+        "lambd_recon": lambd_recon,
+        "input_dim_action": input_dim_action,
+        "hidden_dim_img_encoder": hidden_dim_img_encoder,
+        "hidden_dim_predictor": hidden_dim_predictor,
+        "decoder_hidden_dim": decoder_hidden_dim,
+        "z_dim_img": z_dim_img,
+        "z_dim_action": z_dim_action,
+        "depth_img_encoder": depth_img_encoder,
+        "depth_predictor": depth_predictor,
+    },
+)
+global_step = 0
+
+
+#================================================
 #                TRAIN LOOP
 #================================================
-def autoregressive_forward(seed_glimpse, actions):
-    """Chain T_max model steps, feeding each prediction back as the next input."""
-    current_glimpse_state = seed_glimpse
-    preds = []
-    
-    for t in range(T_max):
-        current_glimpse_state = model(current_glimpse_state, actions[t]) # (B, 1, 28, 28)
-        preds.append(current_glimpse_state)
-    return torch.stack(preds, dim=0) # (T_max, B, 1, 28, 28)
-
-
 for epoch in tqdm(range(epochs), desc="epochs"):
     # ---- train ----
     model.train()
@@ -121,7 +144,8 @@ for epoch in tqdm(range(epochs), desc="epochs"):
             seed, actions, input_images, target_images = rollout(imgs, T_max, scale_sensitivity, translation_sensitivity, device=device)
             
         # 6. Inference
-        ar_steps = min(epoch+1, T_max) # grow horizon over training
+        # if not ar_steps:
+        #     ar_steps = min(epoch+1, T_max) # grow horizon over training
         z_preds, z_img, z_action = model(input_images, actions, ar_steps=ar_steps)
 
         # # 7. MSE over all T_max predicted frames vs true frames
@@ -131,7 +155,7 @@ for epoch in tqdm(range(epochs), desc="epochs"):
         # encode target images
         z_targets, _ = model.encode(target_images)
         # get mse loss
-        loss_mse = model.mse_last_step(z_preds, z_targets)
+        loss_mse = model.mse(z_preds, z_targets, mean=False)
         # get sigreg loss
         loss_sigreg = model.sigreg_loss(z_img)
         # recon loss on encoder's latents
@@ -150,6 +174,16 @@ for epoch in tqdm(range(epochs), desc="epochs"):
         train_batches  += 1
         train_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
+        wandb.log({
+            "train/loss": loss.item(),
+            "train/loss_mse": loss_mse.item(),
+            "train/loss_sigreg": loss_sigreg.item(),
+            "train/loss_recon": loss_recon.item(),
+            "train/ar_steps": ar_steps,
+            "epoch": epoch,
+        }, step=global_step)
+        global_step += 1
+
     # ---- validation ----
     model.eval()
     val_loss_sum, val_batches = 0.0, 0
@@ -158,11 +192,13 @@ for epoch in tqdm(range(epochs), desc="epochs"):
         for imgs, _ in val_pbar:
             imgs = imgs.to(device).squeeze(1)
             seed, actions, input_images, target_images = rollout(imgs, T_max, scale_sensitivity, translation_sensitivity, device=device)
-            z_preds, z_img, z_action = model(input_images, actions, ar_steps=ar_steps)
+            # During validation, we put predicted latent vectors back into predictor instead
+            # of putting actual input latent vectors (no teacher-forcing), thus ar_steps=T_max
+            z_preds, z_img, z_action = model(input_images, actions, ar_steps=input_images.size(1))
             
             # JEPA loss
             z_targets, _ = model.encode(target_images)
-            loss_mse = model.mse_last_step(z_preds, z_targets)
+            loss_mse = model.mse(z_preds, z_targets, mean=False)
             loss_sigreg = model.sigreg_loss(z_img)
             loss = loss_mse + lambd * loss_sigreg
             val_loss_sum += loss.item()
@@ -172,30 +208,55 @@ for epoch in tqdm(range(epochs), desc="epochs"):
     val_avg   = val_loss_sum   / max(val_batches, 1)
     print(f"epoch {epoch:4d}  train {train_avg:.4f}  val {val_avg:.4f}")
 
+    epoch_log = {
+        "epoch": epoch,
+        "train/avg_loss": train_avg,
+        "val/avg_loss": val_avg,
+    }
+
     # Every N epochs, render true vs predicted glimpse sequences from the last val batch
     if epoch % viz_every == 0:
         true_seq = target_images.squeeze(2).cpu() # (B, T_max, 28, 28)
-        z_preds_img = rearrange(z_preds, "b t (h w) -> b t h w", h=6, w=6) # Reshape latent vector to an image (just for viz)
+        s = int(z_dim_img**0.5)
+        z_preds_img = rearrange(z_preds, "b t (h w) -> b t h w", h=s, w=s) # Reshape latent vector to an image (just for viz)
         pred_seq = z_preds_img.squeeze(2).detach().cpu() # (B, T_max, 28, 28)
-        
+
         # Reconstruct image from predictor and encoder
         recon_images_from_predictor = model.decode(z_preds).squeeze(2).detach().cpu()
         recon_images_from_encoder = model.decode(z_img).squeeze(2).detach().cpu()
-        
-        plot_glimpse_frames(true_seq)
-        plot_glimpse_frames(recon_images_from_encoder)
-        plot_glimpse_frames(recon_images_from_predictor)
-        plot_glimpse_frames(pred_seq)
-                
+
+        fig_true        = plot_glimpse_frames(true_seq)
+        fig_recon_enc   = plot_glimpse_frames(recon_images_from_encoder)
+        fig_recon_pred  = plot_glimpse_frames(recon_images_from_predictor)
+        fig_pred_latent = plot_glimpse_frames(pred_seq)
+
+        epoch_log.update({
+            "viz/true":             wandb.Image(fig_true),
+            "viz/recon_encoder":    wandb.Image(fig_recon_enc),
+            "viz/recon_predictor": wandb.Image(fig_recon_pred),
+            "viz/pred_latent":      wandb.Image(fig_pred_latent),
+        })
+        plt.close(fig_true)
+        plt.close(fig_recon_enc)
+        plt.close(fig_recon_pred)
+        plt.close(fig_pred_latent)
+
         # Collapse detector
         with torch.no_grad():
-            z_flat = z_img.reshape(-1, z_img.size(-1))    # (N, D)
-            z_std  = z_flat.std(0).mean().item()          # ~0 = collapsed, ~1 = healthy
+            z_flat = z_img.reshape(-1, z_img.size(-1)) # (N, D)
+            z_std  = z_flat.std(0).mean().item() # ~0 = collapsed, ~1 = healthy
             z_norm = z_flat.norm(dim=-1).mean().item()
             # pairwise cosine of random pairs — should not be ~1
             a, b = z_flat[:50], z_flat[50:100]
             cos = F.cosine_similarity(a, b).mean().item()
         print(f"std={z_std:.3f}  norm={z_norm:.3f}  cos={cos:.3f}")
+        epoch_log.update({
+            "collapse/z_std": z_std,
+            "collapse/z_norm": z_norm,
+            "collapse/cos_sim": cos,
+        })
+
+    wandb.log(epoch_log, step=global_step)
 
 
 
@@ -332,7 +393,7 @@ opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
 
 # -- 2. Train decoder on frozen encoder outputs --
 # We map z_target -> target_image so the decoder learns the encoder's inverse.
-n_steps = 10000
+n_steps = 5000
 for step in range(n_steps):
     imgs, _ = next(iter(train_loader))
     imgs = imgs.squeeze(1).to(device)
@@ -340,7 +401,7 @@ for step in range(n_steps):
         imgs, T_max, scale_sensitivity, translation_sensitivity, device=device,
     )
     with torch.no_grad():
-        # z_preds, z_img, z_action = model(input_images, actions)
+        # z_preds, z_img, z_action = model(input_images, actions, ar_steps=input_images.size(1))
         z_img, _ = model.encode(target_images)    
 
     recon = decoder(z_img)                        # (B, T, 1, H, W)
@@ -360,7 +421,7 @@ with torch.no_grad():
     _, actions, input_images, target_images = rollout(
         imgs, T_max, scale_sensitivity, translation_sensitivity, device=device,
     )
-    z_pred, _, _ = model(input_images, actions, ar_steps=T_max)         # (B, T, D)  predictor output
+    z_pred, _, _ = model(input_images, actions, ar_steps=input_images.size(1))         # (B, T, D)  predictor output
     img_pred = decoder(z_pred)                     # (B, T, 1, H, W)
 
 # -- 4. Plot: rows alternate target / predicted, columns = time --
@@ -385,12 +446,11 @@ plt.show()
 #================================================
 #                SURPRISE EVAL
 #================================================
-# %%
 @torch.no_grad()
 def measure_surprise(model, input_images, actions, target_images):
     """Per-step MSE between predicted and target embeddings.
     Returns shape (B, T)."""
-    z_pred, _, _ = model(input_images, actions, ar_steps=T_max)
+    z_pred, _, _ = model(input_images, actions, ar_steps=input_images.size(1))
     z_target, _ = model.encode(target_images)
     return ((z_pred - z_target) ** 2).mean(dim=-1)   # (B, T)
 
@@ -512,7 +572,6 @@ plt.show()
 #------------------------------------------------
 #          plot trajectories and mode graphs
 #------------------------------------------------
-# %%
 from matplotlib.gridspec import GridSpec
 
 def show_examples_with_decode(mode, decoder=None, n_examples=3, color="tab:red"):
@@ -528,7 +587,7 @@ def show_examples_with_decode(mode, decoder=None, n_examples=3, color="tab:red")
         imgs, T_max, t_perturb, mode=mode, device=device,
     )
     with torch.no_grad():
-        z_pred, _, _ = model(input_images, actions, ar_steps=T_max)
+        z_pred, _, _ = model(input_images, actions, ar_steps=input_images.size(1))
         img_pred = decoder(z_pred)
         z_target, _ = model.encode(target_images)
         surprise = ((z_pred - z_target) ** 2).mean(dim=-1).cpu()
@@ -589,4 +648,4 @@ show_examples_with_decode("teleport",   n_examples=3, color="tab:red")
 show_examples_with_decode("swap_digit", n_examples=3, color="tab:orange")
 show_examples_with_decode("invert",     n_examples=3, color="tab:blue")
 
-# %%
+

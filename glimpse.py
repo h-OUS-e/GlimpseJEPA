@@ -220,9 +220,9 @@ def rollout(imgs, T_max=16, scale_sensitivity=0.2, translation_sensitivity=0.1, 
     frames = torch.stack(frames, dim=1) # (B, T_max+1, 28, 28)
     actions = torch.cat([d_log_scale, d_x, d_y], dim=-1).transpose(0, 1) # (B, T_max, 3)
 
-    seed         = frames[:, 0:1].unsqueeze(2)      # (B, 1, 1, 28, 28)
-    targets      = frames[:, 1:].unsqueeze(2)       # (B, T_max, 1, 28, 28)
-    input_frames = frames[:, :T_max].unsqueeze(2)   # (B, T_max, 1, 28, 28)
+    seed         = frames[:, 0:1].unsqueeze(2).clone() # (B, 1, 1, 28, 28)
+    targets      = frames[:, 1:].unsqueeze(2).clone() # (B, T_max, 1, 28, 28)
+    input_frames = frames[:, :T_max].unsqueeze(2).clone() # (B, T_max, 1, 28, 28)
     
     return seed, actions, input_frames, targets
     

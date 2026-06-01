@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Read(//c/Users/Ous/Documents/Github/EXPERIMENTS/GlimpseJEPA/**)",
+      "Bash(C:/Users/Ous/miniconda3/envs/ML/python.exe -c ' *)"
     ]
   }
 }

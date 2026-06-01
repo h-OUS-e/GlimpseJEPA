@@ -37,7 +37,7 @@ class SimpleMLP(nn.Module):
             nn.Sigmoid(), # Final activation (sigmoid) so pixel values stay in [0, 1].
         )
 
-    def forward(self, images, actions):
+    def forward(self, images, actions, ar_steps=0):
         """
         Args:
             images: (B, T, C, H, W)
@@ -48,19 +48,33 @@ class SimpleMLP(nn.Module):
         # x = images.view(B, T, self.img_dim) # Flatten the input image to a vector of size 28*28 = 784.
         images_flat = rearrange(images, "b t c h w -> b t (c h w)") # Flatten the input image to a vector of size 1*28*28 = 784.
         
-        # Run through mlp model, auto-regressively
+        if not ar_steps or ar_steps==0:
+            x = images_flat
+            x = torch.cat([x, actions], dim=-1)
+            x = self.net(x) # (B, T, 28* 28)
+            x = x.view(B, T, self.img_hw, self.img_hw)
+            return x
+
+        # Run through mlp model, auto-regressively up until ar_steps
         preds = []
+        ar_steps = min(ar_steps, T)
         x = images_flat[:, 0] # the seed image
-        for t in range(T):
+        for t in range(ar_steps):
             x = torch.cat([x, actions[:, t]], dim=-1) #  Concatenate with the action vector of size 3, giving an input of size 787.
             x = self.net(x) # (B, 1, 28, 28)
             preds.append(x.view(B, 1, self.img_hw, self.img_hw))
         
-        # Change from list to torch tensor of shape (B, T, C, H, W)
-        out = torch.stack(preds, dim=1)
+        # Change from list to torch tensor of shape (B, T, H, W)
+        preds_ar = torch.stack(preds, dim=1).squeeze(2)
         
-        # We return all predictions for visualization. We only calc loss for last pred though.
-        return out
+        if ar_steps >= T:
+            return preds_ar
+        
+        # Tail: teacher-forced on the remaining true frames, conditioned on the AR prefix
+        x_full = torch.cat([preds_ar, images_flat[:, ar_steps+1]], dim=1)
+        preds_tail = torch.cat([x_full, actions])[:, ar_steps:]
+        
+        return torch.cat([preds_ar, preds_tail], dim=1)
 
 
 
@@ -180,51 +194,175 @@ class ARPredictorSimple(nn.Module):
 
         self.net = DeepMLP(z_dim_img + z_dim_action, hidden_dim, z_dim_img, depth=depth)
 
-    def forward(self, z_img, z_action, ar_steps=0):
+    def forward(self, z_img, z_action):
         """
-        ar_steps=0  → teacher forcing (parallel, fast, stable)
-        ar_steps=K  → first K steps are autoregressive, rest teacher-forced
-        ar_steps=T  → full AR (what you have now)
-        """
-        B, T, _ = z_img.size()
-        if ar_steps <= 0:
-            # teacher-forced path (not autoregressive)
-            x = torch.cat([z_img, z_action], dim=-1)
-            return self.net(x)
+        Parallel pass; autoregressive rollout is handled by JEPA.predict.
 
-        # mixed: AR for the first ar_steps, then teacher-forced for the rest
-        z_preds = []
-        x = z_img[:, 0:1]
-        for t in range(ar_steps):
-            x = torch.cat([x, z_action[:, t:t+1]], dim=-1)
-            x = self.net(x)
-            z_preds.append(x)
-            
-        # remaining steps teacher-forced (parallel)
-        if ar_steps < T:
-            tail = torch.cat([z_img[:, ar_steps:], z_action[:, ar_steps:]], dim=-1)
-            z_preds.append(self.net(tail))
-            
-        return torch.cat(z_preds, dim=1)
+        Args:
+            z_img: (B, T, D_z)
+            z_action: (B, T, D_a)
+        """
+        x = torch.cat([z_img, z_action], dim=-1)
+        return self.net(x)
 
         
-
 class ARPredictorSimpleAdaLN(nn.Module):
-    """Like ARPredictorSimple, but uses Adaptive Layer Normalization or FiLM"""
+    """FiLM-conditioned predictor with optional autoregressive rollout."""
     def __init__(self, z_dim, a_dim, hidden_dim=512):
         super().__init__()
         self.up = nn.Linear(z_dim, hidden_dim)
-        self.film = nn.Linear(a_dim, 2 * hidden_dim)   # zero-init for stability:
+        self.film = nn.Linear(a_dim, 2 * hidden_dim)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
         self.down = nn.Linear(hidden_dim, z_dim)
 
-    def forward(self, z_img, z_action):
-        h = self.up(z_img)
-        gamma, beta = self.film(z_action).chunk(2, dim=-1)
+    def _step(self, z, a):
+        # per-step block: (B, *, D_z), (B, *, D_a) -> (B, *, D_z)
+        h = self.up(z)
+        gamma, beta = self.film(a).chunk(2, dim=-1)
         h = h * (1 + gamma) + beta
         return self.down(h)
-        
+
+    def forward(self, z_img, z_action):
+        """
+        Parallel pass; autoregressive rollout is handled by JEPA.predict.
+
+        Args:
+            z_img:    (B, T, D_z)
+            z_action: (B, T, D_a)
+        Returns:  (B, T, D_z)
+        """
+        return self._step(z_img, z_action)
+
+
+# class ARPredictorLSTM(nn.Module):
+#     """LSTM predictor with hidden state for memory across the trajectory.
+
+#     Args:
+#         z_dim_img:    dim of input/output image embedding
+#         z_dim_action: dim of action embedding
+#         hidden_dim:   LSTM hidden state size
+#         num_layers:   stack depth (1 is fine for MNIST scale)
+#     """
+#     def __init__(self, z_dim_img, z_dim_action, hidden_dim=512, num_layers=1):
+#         super().__init__()
+#         self.lstm = nn.LSTM(
+#             input_size=z_dim_img + z_dim_action,
+#             hidden_size=hidden_dim,
+#             num_layers=num_layers,
+#             batch_first=True,
+#         )
+#         self.head = nn.Linear(hidden_dim, z_dim_img)
+
+#     def forward(self, z_img, z_action, ar_steps=0):
+#         """
+#         z_img:    (B, T, D_img)
+#         z_action: (B, T, D_action)
+#         ar_steps: 0 = pure teacher forcing, T = pure AR, in-between = curriculum
+#         Returns:  z_pred (B, T, D_img)
+#         """
+#         B, T, _ = z_img.size()
+
+#         # Teacher-forced path — single parallel LSTM call. Fast and stable.
+#         if ar_steps <= 0:
+#             x = torch.cat([z_img, z_action], dim=-1)         # (B, T, D_in)
+#             h, _ = self.lstm(x)                               # (B, T, H)
+#             return self.head(h)                               # (B, T, D_img)
+
+#         # Mixed path: AR for the first ar_steps, TF for the rest.
+#         preds = []
+#         x_t = z_img[:, 0:1]                                   # seed = true first frame
+#         h_state = None                                        # LSTM zero-init h, c
+
+#         for t in range(ar_steps):
+#             inp = torch.cat([x_t, z_action[:, t:t+1]], dim=-1)   # (B, 1, D_in)
+#             h, h_state = self.lstm(inp, h_state)                  # (B, 1, H), state carries
+#             x_t = self.head(h)                                     # (B, 1, D_img) — predicted next
+#             preds.append(x_t)
+
+#         # Remaining steps teacher-forced, continuing from the carried hidden state.
+#         if ar_steps < T:
+#             tail_in = torch.cat([z_img[:, ar_steps:], z_action[:, ar_steps:]], dim=-1)
+#             h, _ = self.lstm(tail_in, h_state)
+#             preds.append(self.head(h))
+
+#         return torch.cat(preds, dim=1)                         # (B, T, D_img)
+
+
+# class ARPredictorTransformer(nn.Module):
+#     """Causal transformer predictor. Each position t attends to ≤ t.
+
+#     Args:
+#         z_dim_img:    dim of input/output image embedding
+#         z_dim_action: dim of action embedding
+#         hidden_dim:   internal width
+#         depth:        number of transformer layers
+#         heads:        number of attention heads
+#         mlp_mult:     FFN expansion factor
+#         dropout:      dropout in attn + FFN
+#         max_T:        max trajectory length (for positional embeddings)
+#     """
+#     def __init__(self, z_dim_img, z_dim_action, hidden_dim=256, depth=4,
+#                  heads=4, mlp_mult=4, dropout=0.1, max_T=32):
+#         super().__init__()
+#         self.input_proj = nn.Linear(z_dim_img + z_dim_action, hidden_dim)
+#         self.pos_emb = nn.Parameter(torch.zeros(1, max_T, hidden_dim))
+#         nn.init.normal_(self.pos_emb, std=0.02)
+
+#         layer = nn.TransformerEncoderLayer(
+#             d_model=hidden_dim,
+#             nhead=heads,
+#             dim_feedforward=hidden_dim * mlp_mult,
+#             dropout=dropout,
+#             batch_first=True,
+#             activation="gelu",
+#             norm_first=True,        # pre-LN: more stable
+#         )
+#         self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
+#         self.head = nn.Linear(hidden_dim, z_dim_img)
+
+#     def _tf_forward(self, z_img, z_action):
+#         """Teacher-forced parallel pass with causal mask."""
+#         B, T, _ = z_img.size()
+#         x = torch.cat([z_img, z_action], dim=-1)
+#         x = self.input_proj(x) + self.pos_emb[:, :T]
+#         mask = torch.triu(                                     # True = blocked
+#             torch.ones(T, T, device=x.device, dtype=torch.bool),
+#             diagonal=1,
+#         )
+#         h = self.transformer(x, mask=mask)
+#         return self.head(h)
+
+#     def forward(self, z_img, z_action, ar_steps=0):
+#         """
+#         ar_steps=0: pure teacher forcing (parallel, fast, stable)
+#         ar_steps=T: pure AR
+#         in between: AR for first ar_steps, TF for the rest
+#         """
+#         B, T, _ = z_img.size()
+#         if ar_steps <= 0:
+#             return self._tf_forward(z_img, z_action)
+
+#         ar_steps = min(ar_steps, T)
+#         z_in = z_img[:, 0:1]                                   # true seed
+#         preds_ar = []
+#         for t in range(ar_steps):
+#             pred_seq = self._tf_forward(z_in, z_action[:, :t+1])
+#             next_pred = pred_seq[:, -1:]                       # (B, 1, D)
+#             preds_ar.append(next_pred)
+#             if t + 1 < T:
+#                 z_in = torch.cat([z_in, next_pred], dim=1)
+
+#         preds_ar = torch.cat(preds_ar, dim=1)                  # (B, ar_steps, D)
+#         if ar_steps >= T:
+#             return preds_ar
+
+#         # Tail with TF, conditioned on the AR-built prefix (full history available)
+#         z_full = torch.cat([z_in, z_img[:, ar_steps:T]], dim=1)
+#         full_preds = self._tf_forward(z_full, z_action)
+#         preds_tail = full_preds[:, ar_steps:T]                 # (B, T-ar_steps, D)
+#         return torch.cat([preds_ar, preds_tail], dim=1)        # (B, T, D)
+
 
 class ImageEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, z_dim, depth=3):
@@ -367,6 +505,7 @@ class Transformer(nn.Module):
         mlp_dim,
         dropout=0.0,
         block_class=Block,
+        action_dim=None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -380,10 +519,11 @@ class Transformer(nn.Module):
             else nn.Identity()
         )
 
-        # "condition" projector is for action
+        # "condition" projector is for action; the action embedding has its own dim
+        action_dim = action_dim or input_dim
         self.cond_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
+            nn.Linear(action_dim, hidden_dim)
+            if action_dim != hidden_dim
             else nn.Identity()
         )
 
@@ -466,6 +606,7 @@ class ARPredictor(nn.Module):
         input_dim,
         hidden_dim,
         output_dim=None,
+        action_dim=None,
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
@@ -484,18 +625,22 @@ class ARPredictor(nn.Module):
             mlp_dim,
             dropout,
             block_class=ConditionalBlock,
+            action_dim=action_dim,
         )
 
     def forward(self, x, c):
         """
-        x: (B, T, d)
-        c: (B, T, act_dim)
+        Parallel causal pass. Autoregressive rollout is handled by JEPA.predict.
+
+        Args:
+            x: (B, T, d) encoded observations
+            c: (B, T, act_dim) encoded actions
         """
         T = x.size(1)
         x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)
-        x = self.transformer(x, c)
-        return x
+        return self.transformer(x, c)
+    
     
     
 class ActionEncoder(nn.Module):

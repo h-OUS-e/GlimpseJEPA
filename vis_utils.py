@@ -20,3 +20,4 @@ def plot_glimpse_frames(glimpse_frames, max_batch: int = 3):
     plt.suptitle("rows = batch, cols = t (after applying delta t)")
     plt.tight_layout()
     plt.show()
+    return fig

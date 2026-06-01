@@ -201,11 +201,21 @@ class JEPA(nn.Module):
         assert self.decoder is not None, "No decoder attached."
         img = self.decoder(z_img)
         return img
+    
+    def topk_mse(self, pred, target, frac=0.2):
+        # pred/target: (B, T, 1, H, W)
+        err = (pred - target.float()).square()
+        err = err.flatten(start_dim=2)  # (B, T, pixels)
+        k = max(1, int(frac * err.size(-1)))
+        return err.topk(k, dim=-1).values.mean()
 
     def recon_loss(self, z_img, images):
         """MSE between decoded latents and ground-truth images."""
         recon = self.decode(z_img)
-        return F.mse_loss(recon, images.float())
+        mse = F.mse_loss(recon, images.float())
+        topk_mse = self.topk_mse(recon, images.float(), frac=0.2)
+        recon_loss = 0.5 * mse + 0.5 * topk_mse
+        return recon_loss
     
     
     def mse_last_step(self, z_pred, z_target, mean=True):

@@ -445,15 +445,45 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+def apply_rope(x, theta=10000.0):
+    """
+    Apply rotary position embeddings to q/k tensors.
+
+    Args:
+        x: (B, heads, T, dim_head)
+    """
+    dim = x.size(-1)
+    rot_dim = dim - (dim % 2)
+    if rot_dim == 0:
+        return x
+
+    x_rot = x[..., :rot_dim]
+    x_pass = x[..., rot_dim:]
+
+    positions = torch.arange(x.size(-2), device=x.device, dtype=x.dtype)
+    freqs = torch.arange(0, rot_dim, 2, device=x.device, dtype=x.dtype)
+    inv_freq = theta ** (-freqs / rot_dim)
+    angles = positions[:, None] * inv_freq[None, :]
+    cos = angles.cos()[None, None, :, :]
+    sin = angles.sin()[None, None, :, :]
+
+    x1 = x_rot[..., 0::2]
+    x2 = x_rot[..., 1::2]
+    x_rot = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+    x_rot = x_rot.flatten(-2)
+    return torch.cat((x_rot, x_pass), dim=-1)
+
+
 class Attention(nn.Module):
     """Scaled dot-product attention with causal masking"""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, rope_theta=10000.0):
         super().__init__()
         inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
         self.heads = heads
         self.dropout = dropout
+        self.rope_theta = rope_theta
         self.norm = nn.LayerNorm(dim)
         self.attend = nn.Softmax(dim=-1)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
@@ -471,6 +501,8 @@ class Attention(nn.Module):
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        q = apply_rope(q, theta=self.rope_theta)
+        k = apply_rope(k, theta=self.rope_theta)
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
@@ -478,10 +510,10 @@ class Attention(nn.Module):
 class Block(nn.Module):
     """Standard Transformer block"""
 
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0, rope_theta=10000.0):
         super().__init__()
 
-        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout, rope_theta=rope_theta)
         self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -506,6 +538,7 @@ class Transformer(nn.Module):
         dropout=0.0,
         block_class=Block,
         action_dim=None,
+        rope_theta=10000.0,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -539,7 +572,7 @@ class Transformer(nn.Module):
 
         for _ in range(depth):
             self.layers.append(
-                block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
+                block_class(hidden_dim, heads, dim_head, mlp_dim, dropout, rope_theta=rope_theta)
             )
 
     def forward(self, x, c=None):
@@ -572,10 +605,10 @@ class ConditionalBlock(nn.Module):
     AdaLN stands for Adaptive Layer Normalization.    
     """
 
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0, rope_theta=10000.0):
         super().__init__()
 
-        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout, rope_theta=rope_theta)
         self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -610,10 +643,10 @@ class ARPredictor(nn.Module):
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
+        rope_theta=10000.0,
     ):
         super().__init__()
-        # TODO: replace with RoPE?
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
+        self.num_frames = num_frames
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim,
@@ -626,6 +659,7 @@ class ARPredictor(nn.Module):
             dropout,
             block_class=ConditionalBlock,
             action_dim=action_dim,
+            rope_theta=rope_theta,
         )
 
     def forward(self, x, c):
@@ -636,8 +670,6 @@ class ARPredictor(nn.Module):
             x: (B, T, d) encoded observations
             c: (B, T, act_dim) encoded actions
         """
-        T = x.size(1)
-        x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)
         return self.transformer(x, c)
     

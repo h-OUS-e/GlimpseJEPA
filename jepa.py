@@ -213,8 +213,8 @@ class JEPA(nn.Module):
         """MSE between decoded latents and ground-truth images."""
         recon = self.decode(z_img)
         mse = F.mse_loss(recon, images.float())
-        topk_mse = self.topk_mse(recon, images.float(), frac=0.2)
-        recon_loss = 0.5 * mse + 0.5 * topk_mse
+        # topk_mse = self.topk_mse(recon, images.float(), frac=0.2)
+        recon_loss = mse #+ 0.5 * topk_mse
         return recon_loss
     
     

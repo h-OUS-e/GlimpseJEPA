@@ -29,7 +29,7 @@ translation_sensitivity = 0.1
 batch_size = 64
 T_max = 10
 lr = 4e-4
-epochs = 20
+epochs = 20 #20
 viz_every = 1
 lambd = 0.09 # sigreg loss coefficient
 lambd_recon = 0.1
@@ -39,6 +39,7 @@ ar_steps = 0 # Teacher-forcing
 input_dim_action = 3 # log_scale, x, y are only 3 parameters
 hidden_dim_img_encoder = 512
 hidden_dim_predictor = 512
+
 decoder_hidden_dim = 512
 z_dim_img = 36
 z_dim_action = 3

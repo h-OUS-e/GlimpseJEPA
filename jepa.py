@@ -76,32 +76,57 @@ class JEPA(nn.Module):
         encoder,
         predictor,
         action_encoder,
+        memory_encoder=None,
+        memory_predictor=None,
         decoder=None,
         projector=None,
         projector_pred=None,
+        encode_memory=True,
         knots=17,
         num_proj=512
     ):
         super().__init__()
         
         self.encoder = encoder
+        self.memory_encoder = memory_encoder
         self.predictor = predictor
+        self.memory_predictor = memory_predictor
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.projector_pred = projector_pred or nn.Identity()
         self.decoder = decoder 
         self.sigreg = SIGReg(knots, num_proj)
         
-    def forward(self, image: torch.Tensor, action: torch.Tensor, ar_steps=0):
+    def forward(self, image: torch.Tensor, action: torch.Tensor, z_memory: torch.Tensor | None = None, ar_steps=0):
         """
         Args:
             image(s): (B, T, C, H, W)
             action(s): (B, T, A) # A = 3 for action glimpse
+            z_memory: (B, T, Z) Previous latent memory stored
         """
+        
         z_img, z_action = self.encode(image, action) # (B, T, Z_img) and (B, T, Z_action)
-        z_pred = self.predict(z_img, z_action, ar_steps=ar_steps)        
+        
+        # encode memory with current image state
+        if self.memory_encoder:
+            z_memory = self.predict_memory(z_memory, image)
+        
+        # predict the next state
+        z_pred = self.predict(z_img, z_action, z_memory, ar_steps=ar_steps)        
         
         return z_pred, z_img, z_action
+    
+    
+    def encode_memory(self, images):
+        """Encodes a set of images into z_memory"""
+        pass
+        
+        
+    def predict_memory(self, z_memory, image):
+        """Predicts the most useful z_memory given past memory 
+        latent state and current state (current image)"""
+        pass
+        
         
     def encode(self, img, action=None):
         """
@@ -141,7 +166,7 @@ class JEPA(nn.Module):
     #     preds = rearrange(preds, "(b t) d -> b t d", b=z_img.size(0)) # unflatten
     #     return preds
     
-    def predict(self, z_img, z_action, ar_steps=0):
+    def predict(self, z_img, z_action, z_memory, ar_steps=0):
         """
         Predict next state embeddings.
 

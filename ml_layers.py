@@ -675,6 +675,54 @@ class ARPredictor(nn.Module):
     
     
     
+class MemoryPredictor(nn.Module):
+    """Causal transformer that builds a running memory latent over a trajectory.
+
+    Trains recurrence in parallel: at step t the causal self-attention over
+    positions <= t is the accumulated prior memory, and a zero-content seed token
+    (position 0, tagged with a learned separator embedding) is the initial memory.
+
+    Note: for a literal recurrent m_{t-1} -> m_t feedback, swap the parallel pass
+    for a sequential loop over T. Kept as a documented alternative, not used here.
+    """
+
+    def __init__(self, z_dim_img, z_dim_memory, hidden_dim=256, depth=2,
+                 heads=4, dim_head=64, mlp_dim=512, rope_theta=10000.0):
+        super().__init__()
+        self.frame_proj = nn.Linear(z_dim_img, hidden_dim)
+        # Learned segment embeddings separate the memory seed from frame tokens
+        self.seg_mem = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.seg_frame = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.normal_(self.seg_mem, std=0.02)
+        nn.init.normal_(self.seg_frame, std=0.02)
+
+        # input already at hidden_dim, so input_proj is Identity; output maps to z_memory
+        self.transformer = Transformer(
+            hidden_dim, hidden_dim, z_dim_memory, depth, heads, dim_head,
+            mlp_dim, block_class=Block, rope_theta=rope_theta,
+        )
+
+    def forward(self, z_img, z_memory_seed=None):
+        """
+        Args:
+            z_img: (B, T, z_dim_img) encoded frame latents
+            z_memory_seed: (B, hidden_dim) optional initial memory, defaults to zeros
+        Returns:
+            z_memory: (B, T, z_dim_memory) where z_memory[:, t] saw frames <= t
+        """
+        B = z_img.size(0)
+        tokens = self.frame_proj(z_img) + self.seg_frame # (B, T, hidden)
+
+        if z_memory_seed is None:
+            seed = self.seg_mem.expand(B, 1, -1) # zero content + separator
+        else:
+            seed = z_memory_seed.unsqueeze(1) + self.seg_mem
+
+        seq = torch.cat([seed, tokens], dim=1) # (B, T+1, hidden)
+        out = self.transformer(seq) # causal pass
+        return out[:, 1:] # drop seed position, keep per-frame memory
+
+
 class ActionEncoder(nn.Module):
     def __init__(
         self,

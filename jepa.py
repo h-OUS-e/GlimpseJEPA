@@ -106,27 +106,28 @@ class JEPA(nn.Module):
         """
         
         z_img, z_action = self.encode(image, action) # (B, T, Z_img) and (B, T, Z_action)
-        
-        # encode memory with current image state
-        if self.memory_encoder:
-            z_memory = self.predict_memory(z_memory, image)
-        
+
+        # build a running memory latent from the encoded frames
+        if self.memory_predictor is not None:
+            z_memory = self.predict_memory(z_img, z_memory)
+
         # predict the next state
-        z_pred = self.predict(z_img, z_action, z_memory, ar_steps=ar_steps)        
-        
+        z_pred = self.predict(z_img, z_action, z_memory, ar_steps=ar_steps)
+
         return z_pred, z_img, z_action
-    
-    
-    def encode_memory(self, images):
-        """Encodes a set of images into z_memory"""
-        pass
-        
-        
-    def predict_memory(self, z_memory, image):
-        """Predicts the most useful z_memory given past memory 
-        latent state and current state (current image)"""
-        pass
-        
+
+
+    def predict_memory(self, z_img, z_memory=None):
+        """Build the running memory latent from encoded frames.
+
+        Args:
+            z_img: (B, T, Z_img) encoded frame latents
+            z_memory: (B, hidden) optional initial memory seed, defaults to zeros
+        Returns:
+            z_memory: (B, T, Z_mem) memory at each step (step t saw frames <= t)
+        """
+        return self.memory_predictor(z_img, z_memory)
+
         
     def encode(self, img, action=None):
         """
@@ -184,9 +185,15 @@ class JEPA(nn.Module):
         """
         T = z_img.size(1)
 
+        # Condition the predictor on action + memory. NOTE: cat(action, memory)
+        # may dilute the action signal -- alternatives to test: (a) separate AdaLN
+        # streams for action vs memory, (b) memory as a prepended sequence token,
+        # (c) add memory into the predictor input x.
+        cond = z_action if z_memory is None else torch.cat([z_action, z_memory], dim=-1)
+
         # Option A: Teacher forcing: single parallel pass over the true embeddings
         if not ar_steps or ar_steps==0:
-            z_preds = self.predictor(z_img, z_action)
+            z_preds = self.predictor(z_img, cond)
             z_preds = self.project(z_preds)
             return z_preds
 
@@ -195,7 +202,7 @@ class JEPA(nn.Module):
         z_in = z_img[:, :1] # true first frame as the seed
         preds = []
         for t in range(ar_steps):
-            raw = self.predictor(z_in, z_action[:, :t + 1])[:, -1:] # predict frame t+1
+            raw = self.predictor(z_in, cond[:, :t + 1])[:, -1:] # predict frame t+1
             pred = self.project(raw)
             preds.append(pred)
             z_in = torch.cat([z_in, pred], dim=1) # feed prediction back as next input
@@ -206,7 +213,7 @@ class JEPA(nn.Module):
 
         # Tail: teacher-forced on the remaining true frames, conditioned on the AR prefix
         z_full = torch.cat([z_in, z_img[:, ar_steps + 1:]], dim=1) # length T
-        tail = self.project(self.predictor(z_full, z_action)[:, ar_steps:])
+        tail = self.project(self.predictor(z_full, cond)[:, ar_steps:])
         return torch.cat([preds, tail], dim=1)
 
     def project(self, preds):

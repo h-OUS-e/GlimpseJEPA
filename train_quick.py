@@ -16,7 +16,7 @@ import wandb
 
 from glimpse import rollout
 from jepa import JEPA
-from ml_layers import ARPredictor, ActionEncoder, ImageEncoder, Decoder, MLP_Projector
+from ml_layers import ARPredictor, ActionEncoder, ImageEncoder, Decoder, MLP_Projector, MemoryPredictor
 from vis_utils import plot_glimpse_frames
 
 
@@ -45,6 +45,13 @@ z_dim_img = 36
 z_dim_action = 3
 depth_img_encoder = 3
 depth_predictor = 2
+
+# memory predictor params
+use_memory = True # toggle for the memory A/B: True = memory on, False = no-memory baseline
+z_dim_memory = 36
+mem_hidden_dim = 256
+mem_depth = 2
+mem_heads = 4
 
 
 # Get device
@@ -82,11 +89,17 @@ action_encoder = ActionEncoder(input_dim_action, emb_dim=z_dim_action)
 
 # predictor = ARPredictorSimpleAdaLN(z_dim_img, z_dim_action, hidden_dim_predictor)
 # predictor = ARPredictorSimple(z_dim_img, z_dim_action, hidden_dim_predictor, depth=depth_predictor)
-predictor = ARPredictor(num_frames=T_max, depth=4, heads=4, mlp_dim=512, input_dim=z_dim_img, hidden_dim=hidden_dim_predictor, output_dim=hidden_dim_predictor, action_dim=z_dim_action)
+# predictor condition is action (+ memory when enabled), so widen action_dim to match cond
+cond_dim = z_dim_action + (z_dim_memory if use_memory else 0)
+predictor = ARPredictor(num_frames=T_max, depth=4, heads=4, mlp_dim=512, input_dim=z_dim_img, hidden_dim=hidden_dim_predictor, output_dim=hidden_dim_predictor, action_dim=cond_dim)
 projector_pred = MLP_Projector(input_dim=hidden_dim_predictor, output_dim=z_dim_img, hidden_dim=256, norm_fn=torch.nn.BatchNorm1d)
 decoder = Decoder(z_dim=z_dim_img, hidden_dim=decoder_hidden_dim, h=H, w=W, depth=2)
+memory_predictor = MemoryPredictor(z_dim_img, z_dim_memory, hidden_dim=mem_hidden_dim, depth=mem_depth, heads=mem_heads) if use_memory else None
+# Pin the encoder-output scale. SigReg alone fails to control latent scale here, letting it
+# drift (z_std 2-25) and destabilize training/decode; a non-affine LayerNorm fixes it.
+projector = nn.LayerNorm(z_dim_img, elementwise_affine=False)
 
-model = JEPA(image_encoder, predictor, action_encoder, decoder=decoder, projector_pred=projector_pred)
+model = JEPA(image_encoder, predictor, action_encoder, decoder=decoder, projector=projector, projector_pred=projector_pred, memory_predictor=memory_predictor)
 
 # 2. Move the model to the right device (cuda if available, else cpu).
 model = model.to(device)
@@ -118,6 +131,7 @@ wandb.init(
         "decoder_hidden_dim": decoder_hidden_dim,
         "z_dim_img": z_dim_img,
         "z_dim_action": z_dim_action,
+        "z_dim_memory": z_dim_memory,
         "depth_img_encoder": depth_img_encoder,
         "depth_predictor": depth_predictor,
     },

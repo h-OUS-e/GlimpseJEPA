@@ -6,6 +6,8 @@ from einops import rearrange
 import einops
 from torch import nn
 
+from ml_layers import ViTSpatialEncoder, ViTSpatialDecoder, STPredictor
+
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
 
@@ -316,15 +318,120 @@ class JEPA(nn.Module):
     def sigreg_loss(self, z_enc):
         """
         Apply SigReg loss to latent vector (usually from the encoder)
-        
+
         Args:
             z_enc: (B, T, D)
         """
         # Transpoze z to apply SigReg per timestep
         z_enc = rearrange(z_enc, "b t ... -> t b ...") # (T, B, D)
         loss = self.sigreg(z_enc)
-        
+
         return loss
-    
-        
-        
+
+    def dmt_loss(self, input_images, actions, target_images):
+        """DAgger Memory Training loss (post-finetune): unroll the predictor on its OWN
+        predictions (actions teacher-forced) and regress to the FROZEN encoder trajectory.
+        Call freeze_for_dmt() first.
+
+        Args:
+            input_images: (B, T, 1, H, W)
+            actions: (B, T, A)
+            target_images: (B, T, 1, H, W)
+        """
+        with torch.no_grad():
+            z_target, _ = self.encode(target_images) # frozen encoder trajectory
+        z_pred, _, _ = self.forward(input_images, actions, ar_steps=input_images.size(1))
+        return F.mse_loss(z_pred, z_target.detach())
+
+    def freeze_for_dmt(self):
+        """Freeze the whole model except the predictor (DMT trains only the RNN/predictor
+        with a small LR). Returns the trainable params for the optimizer."""
+        for p in self.parameters():
+            p.requires_grad_(False)
+        for p in self.predictor.parameters():
+            p.requires_grad_(True)
+        return list(self.predictor.parameters())
+
+
+class SpatialJEPA(nn.Module):
+    """Token-grid JEPA: ViT spatial latent + spatiotemporal residual predictor + conv-head decoder.
+
+    The flat-vector JEPA above is the preserved path; this is the spatial path that keeps spatial
+    layout (sharp recon) at far fewer params. Recon is a DETACHED probe (visualization only), so
+    prediction + gentle per-token SigReg shape the tokens. Pair with DMT (dmt_loss) to cut AR drift.
+    """
+
+    def __init__(self, c=8, patch=7, img=28, max_frames=16, sig_w=0.05, rec_w=1.0,
+                 knots=17, num_proj=512):
+        super().__init__()
+        n = (img // patch) ** 2
+        self.enc = ViTSpatialEncoder(patch=patch, c=c, img=img)
+        self.pred = STPredictor(c=c, n=n, max_frames=max_frames)
+        self.dec = ViTSpatialDecoder(patch=patch, c=c, img=img)
+        self.sigreg = SIGReg(knots, num_proj)
+        self.sig_w, self.rec_w = sig_w, rec_w
+
+    def encode(self, frames):
+        """(B, T, 1, H, W) -> (B, T, N, C) token grid per frame."""
+        B = frames.size(0)
+        z = self.enc(rearrange(frames.float(), "b t o h w -> (b t) o h w"))
+        return rearrange(z, "(b t) n c -> b t n c", b=B)
+
+    def decode(self, tokens):
+        """(B, T, N, C) -> (B, T, 1, H, W) pixel probabilities."""
+        B = tokens.size(0)
+        logits = self.dec(rearrange(tokens, "b t n c -> (b t) n c"))
+        return rearrange(torch.sigmoid(logits), "(b t) o h w -> b t o h w", b=B)
+
+    def predict(self, tokens, actions):
+        """Teacher-forced next-frame token prediction: (B, T, N, C)."""
+        return self.pred(tokens, actions)
+
+    def ar_rollout(self, z_seed, actions, steps=None):
+        """Honest autoregressive rollout from a seed token grid (grad flows through the predictor).
+
+        Args:
+            z_seed: (B, 1, N, C) encoded seed frame
+            actions: (B, T, 3)
+        Returns:
+            (B, T, N, C) predicted frames 1..T
+        """
+        steps = steps or actions.size(1)
+        z = z_seed
+        for t in range(steps):
+            nxt = self.pred(z, actions[:, :t + 1])[:, -1:]
+            z = torch.cat([z, nxt], dim=1)
+        return z[:, 1:]
+
+    def loss(self, inp, actions, tgt):
+        """Teacher-forced training loss: prediction MSE + gentle SigReg + detached recon probe."""
+        z_in = self.encode(inp)
+        z_tgt = self.encode(tgt).detach()
+        z_pred = self.pred(z_in, actions)
+        loss_mse = F.mse_loss(z_pred, z_tgt)
+        loss_sig = self.sigreg(rearrange(z_in, "b t n c -> t b (n c)"))
+        logits = self.dec(rearrange(z_in.detach(), "b t n c -> (b t) n c"))  # decoder is a probe
+        inp_f = rearrange(inp.float(), "b t o h w -> (b t) o h w")
+        loss_rec = F.binary_cross_entropy_with_logits(logits, inp_f)
+        loss = loss_mse + self.sig_w * loss_sig + self.rec_w * loss_rec
+        return loss, {"mse": loss_mse.item(), "sig": loss_sig.item(), "rec": loss_rec.item()}
+
+    def dmt_loss(self, inp, actions, tgt):
+        """DAgger Memory Training loss (post-finetune): unroll the predictor on its OWN predictions
+        and regress to the FROZEN encoder trajectory. Call freeze_for_dmt() first."""
+        with torch.no_grad():
+            z_seed = self.encode(inp)[:, :1]
+            z_target = self.encode(tgt)
+        z_ar = self.ar_rollout(z_seed, actions)
+        return F.mse_loss(z_ar, z_target.detach())
+
+    def freeze_for_dmt(self):
+        """Freeze encoder + decoder, train only the predictor. Returns the trainable params."""
+        for p in self.enc.parameters():
+            p.requires_grad_(False)
+        for p in self.dec.parameters():
+            p.requires_grad_(False)
+        for p in self.pred.parameters():
+            p.requires_grad_(True)
+        return list(self.pred.parameters())
+

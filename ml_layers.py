@@ -747,3 +747,131 @@ class ActionEncoder(nn.Module):
         x = self.patch_embed(x)
         x = self.embed(x)
         return x
+
+
+#================================================
+#     Spatial-latent JEPA modules (ViT tokens)
+#================================================
+# Validated direction: a ViT token grid (e.g. 16 tokens x 8) instead of a flat vector keeps spatial
+# layout, so the decoder renders sharp digits instead of blur. The predictor is spatiotemporal
+# (block-causal AdaLN) and predicts token residuals. See SpatialJEPA in jepa.py.
+
+class ViTBlock(nn.Module):
+    """Pre-LN transformer block, full (bidirectional) self-attention."""
+    def __init__(self, dim, heads=4, mlp=4):
+        super().__init__()
+        self.n1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.n2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * mlp), nn.GELU(), nn.Linear(dim * mlp, dim))
+
+    def forward(self, x):
+        h = self.n1(x)
+        x = x + self.attn(h, h, h, need_weights=False)[0]
+        x = x + self.mlp(self.n2(x))
+        return x
+
+
+class ViTSpatialEncoder(nn.Module):
+    """Image -> (B, N, C) patch tokens. Per-token non-affine LN pins scale for SigReg."""
+    def __init__(self, patch=7, c=8, hidden=64, depth=2, heads=4, img=28):
+        super().__init__()
+        self.p, self.np = patch, img // patch
+        n = self.np ** 2
+        self.embed = nn.Linear(patch * patch, hidden)
+        self.pos = nn.Parameter(torch.randn(1, n, hidden) * 0.02)
+        self.blocks = nn.ModuleList([ViTBlock(hidden, heads) for _ in range(depth)])
+        self.to_latent = nn.Linear(hidden, c)
+        self.norm = nn.LayerNorm(c, elementwise_affine=False)
+
+    def forward(self, img):  # (B*,1,H,W) -> (B*,N,C)
+        x = self.embed(rearrange(img, "b o (h p1) (w p2) -> b (h w) (o p1 p2)", p1=self.p, p2=self.p)) + self.pos
+        for blk in self.blocks:
+            x = blk(x)
+        return self.norm(self.to_latent(x))
+
+
+class ViTSpatialDecoder(nn.Module):
+    """(B*, N, C) -> logits (B*,1,H,W). ViT blocks give tokens global context, then a CONV render head
+    upsamples the token grid so neighbors blend (no per-patch seams/gridding)."""
+    def __init__(self, patch=7, c=8, hidden=64, depth=2, heads=4, img=28):
+        super().__init__()
+        self.np = img // patch
+        n = self.np ** 2
+        self.from_latent = nn.Linear(c, hidden)
+        self.pos = nn.Parameter(torch.randn(1, n, hidden) * 0.02)
+        self.blocks = nn.ModuleList([ViTBlock(hidden, heads) for _ in range(depth)])
+        if self.np == 4:    # patch 7: 4 -> 7 -> 14 -> 28
+            self.head = nn.Sequential(
+                nn.ConvTranspose2d(hidden, hidden, 4, 1, 0), nn.GELU(),
+                nn.ConvTranspose2d(hidden, 32, 4, 2, 1), nn.GELU(),
+                nn.ConvTranspose2d(32, 1, 4, 2, 1))
+        elif self.np == 7:  # patch 4: 7 -> 14 -> 28
+            self.head = nn.Sequential(
+                nn.ConvTranspose2d(hidden, 32, 4, 2, 1), nn.GELU(),
+                nn.ConvTranspose2d(32, 1, 4, 2, 1))
+        else:
+            raise ValueError(f"conv head supports img//patch in {{4,7}}, got {self.np}")
+
+    def forward(self, tok):  # (B*,N,C) -> (B*,1,H,W) logits
+        x = self.from_latent(tok) + self.pos
+        for blk in self.blocks:
+            x = blk(x)
+        x = rearrange(x, "b (h w) d -> b d h w", h=self.np)
+        return self.head(x)
+
+
+class STBlock(nn.Module):
+    """Spatiotemporal block with AdaLN-zero on the action. Tokens are flat (B, L, H); a block-causal
+    mask lets frame t attend to all tokens of frames <= t."""
+    def __init__(self, dim, heads=4, mlp=4):
+        super().__init__()
+        self.h = heads
+        self.n1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.n2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * mlp), nn.GELU(), nn.Linear(dim * mlp, dim))
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.ada[-1].weight); nn.init.zeros_(self.ada[-1].bias)
+
+    def forward(self, x, c, mask):  # x:(B,L,H) c:(B,L,H) mask:(L,L)
+        sh1, sc1, g1, sh2, sc2, g2 = self.ada(c).chunk(6, dim=-1)
+        h = self.n1(x) * (1 + sc1) + sh1
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        q, k, v = (rearrange(t, "b l (h d) -> b h l d", h=self.h) for t in (q, k, v))
+        a = rearrange(F.scaled_dot_product_attention(q, k, v, attn_mask=mask), "b h l d -> b l (h d)")
+        x = x + g1 * self.proj(a)
+        x = x + g2 * self.mlp(self.n2(x) * (1 + sc2) + sh2)
+        return x
+
+
+class STPredictor(nn.Module):
+    """Spatiotemporal residual predictor over a token grid. Block-causal across time, AdaLN on action;
+    predicts the residual from the current frame's tokens (consecutive glimpses are close)."""
+    def __init__(self, c=8, hidden=128, depth=4, heads=4, n=16, max_frames=16):
+        super().__init__()
+        self.n = n
+        self.in_proj = nn.Linear(c, hidden)
+        self.act_proj = nn.Linear(3, hidden)
+        self.sp_pos = nn.Parameter(torch.randn(1, 1, n, hidden) * 0.02)
+        self.tp_pos = nn.Parameter(torch.randn(1, max_frames, 1, hidden) * 0.02)
+        self.blocks = nn.ModuleList([STBlock(hidden, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(hidden)
+        self.out = nn.Linear(hidden, c)
+
+    def _mask(self, Tn, device):
+        fi = torch.arange(Tn, device=device).repeat_interleave(self.n)
+        return fi[None, :] <= fi[:, None]  # block-causal, True=keep
+
+    def forward(self, tokens, action):  # (B,T,N,C),(B,T,3) -> next-frame tokens (B,T,N,C)
+        B, Tn, Nn, _ = tokens.shape
+        h = self.in_proj(tokens) + self.sp_pos + self.tp_pos[:, :Tn]
+        h = rearrange(h, "b t n d -> b (t n) d")
+        c = self.act_proj(action)[:, :, None, :].expand(B, Tn, Nn, -1)
+        c = rearrange(c, "b t n d -> b (t n) d")
+        mask = self._mask(Tn, tokens.device)
+        for blk in self.blocks:
+            h = blk(h, c, mask)
+        delta = rearrange(self.out(self.norm(h)), "b (t n) c -> b t n c", t=Tn)
+        return tokens + delta  # residual

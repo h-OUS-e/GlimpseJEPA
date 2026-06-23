@@ -84,11 +84,12 @@ class JEPA(nn.Module):
         projector=None,
         projector_pred=None,
         encode_memory=True,
+        mem_mode="adaln",
         knots=17,
         num_proj=512
     ):
         super().__init__()
-        
+
         self.encoder = encoder
         self.memory_encoder = memory_encoder
         self.predictor = predictor
@@ -96,8 +97,15 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.projector_pred = projector_pred or nn.Identity()
-        self.decoder = decoder 
+        self.decoder = decoder
         self.sigreg = SIGReg(knots, num_proj)
+
+        # How memory reaches the predictor (see predict()):
+        #  "adaln"   -> memory concatenated onto the action cond (rides the AdaLN scale/shift channel; original)
+        #  "content" -> memory concatenated onto the predictor INPUT x, kept as separate channels from the
+        #               current state so the predictor can weight them independently (Idea A, content channel).
+        # In "content" mode build the predictor with action_dim = z_action and input_dim = z_img + z_memory.
+        self.mem_mode = mem_mode
         
     def forward(self, image: torch.Tensor, action: torch.Tensor, z_memory: torch.Tensor | None = None, ar_steps=0):
         """
@@ -187,24 +195,29 @@ class JEPA(nn.Module):
         """
         T = z_img.size(1)
 
-        # Condition the predictor on action + memory. NOTE: cat(action, memory)
-        # may dilute the action signal -- alternatives to test: (a) separate AdaLN
-        # streams for action vs memory, (b) memory as a prepended sequence token,
-        # (c) add memory into the predictor input x.
-        cond = z_action if z_memory is None else torch.cat([z_action, z_memory], dim=-1)
+        # Memory routing (set by mem_mode at construction):
+        #  - "adaln":   cond = cat(action, memory) -> memory rides the AdaLN scale/shift channel (original).
+        #  - "content": cond = action only; memory is added to the predictor INPUT x via the zero-init
+        #               mem_proj, so attention can use it as content (Idea A; wins in the flat setting).
+        if self.mem_mode == "content":
+            cond = z_action
+            mem = z_memory   # concatenated to the predictor INPUT (separate channels, not summed in)
+        else:
+            cond = z_action if z_memory is None else torch.cat([z_action, z_memory], dim=-1)
+            mem = None
 
         # Option A: Teacher forcing: single parallel pass over the true embeddings
-        if not ar_steps or ar_steps==0:
-            z_preds = self.predictor(z_img, cond)
-            z_preds = self.project(z_preds)
-            return z_preds
+        if not ar_steps or ar_steps == 0:
+            x = z_img if mem is None else torch.cat([z_img, mem], dim=-1)
+            return self.project(self.predictor(x, cond))
 
         # Option B: No teacher forcing up until AR_steps
         ar_steps = min(ar_steps, T)
         z_in = z_img[:, :1] # true first frame as the seed
         preds = []
         for t in range(ar_steps):
-            raw = self.predictor(z_in, cond[:, :t + 1])[:, -1:] # predict frame t+1
+            x = z_in if mem is None else torch.cat([z_in, mem[:, :t + 1]], dim=-1)
+            raw = self.predictor(x, cond[:, :t + 1])[:, -1:] # predict frame t+1
             pred = self.project(raw)
             preds.append(pred)
             z_in = torch.cat([z_in, pred], dim=1) # feed prediction back as next input
@@ -215,7 +228,8 @@ class JEPA(nn.Module):
 
         # Tail: teacher-forced on the remaining true frames, conditioned on the AR prefix
         z_full = torch.cat([z_in, z_img[:, ar_steps + 1:]], dim=1) # length T
-        tail = self.project(self.predictor(z_full, cond)[:, ar_steps:])
+        xf = z_full if mem is None else torch.cat([z_full, mem], dim=-1)
+        tail = self.project(self.predictor(xf, cond)[:, ar_steps:])
         return torch.cat([preds, tail], dim=1)
 
     def project(self, preds):
@@ -235,7 +249,23 @@ class JEPA(nn.Module):
         assert self.decoder is not None, "No decoder attached."
         img = self.decoder(z_img)
         return img
-    
+
+    # TODO: Delete commented lines below (from quick nextLat test)
+    # def decode_sg(self, z_img):
+    #     """Decode with the decoder's weights frozen (NextLat's frozen head): gradient
+    #     reaches z_img but not the decoder params, so the consistency term shapes only
+    #     the predictor/encoder, not the decoder."""
+    #     assert self.decoder is not None, "No decoder attached."
+    #     params = {n: p.detach() for n, p in self.decoder.named_parameters()}
+    #     buffers = {n: b.detach() for n, b in self.decoder.named_buffers()}
+    #     return torch.func.functional_call(self.decoder, (params, buffers), (z_img,))
+
+    # def pred_decode_loss(self, z_pred, z_target):
+    #     """NextLat L_KL analog for continuous vision: distill the predicted-latent decode
+    #     toward the true-latent decode through the frozen decoder. Makes a predicted latent
+    #     correct only if it decodes to the same image as the true latent (not just L2-near)."""
+    #     return F.mse_loss(self.decode_sg(z_pred), self.decode_sg(z_target).detach())
+
     def topk_mse(self, pred, target, frac=0.2):
         # pred/target: (B, T, 1, H, W)
         err = (pred - target.float()).square()
@@ -273,20 +303,26 @@ class JEPA(nn.Module):
         return loss
     
     
-    def mse(self, z_pred, z_target, mean=True):
+    def mse(self, z_pred, z_target, mean=True, loss_type="mse", beta=1.0):
         """
         Compute cost between predicted and target embeddings for
         each state.
-        
+
         Args:
             z_pred: (B, T, D)
             z_target: (B, T, D)
-        """       
+            loss_type: "mse" or "smooth_l1" (NextLat uses SmoothL1 for robustness)
+            beta: SmoothL1 transition point between L2 and L1 regimes
+        """
+        # SmoothL1 falls back to L1 for large errors, less drift-sensitive than MSE
+        fn = (lambda p, t, r: F.smooth_l1_loss(p, t, reduction=r, beta=beta)) if loss_type == "smooth_l1" \
+            else (lambda p, t, r: F.mse_loss(p, t, reduction=r))
+
         # return loss for each action candidate
         if mean:
-            loss = F.mse_loss(z_pred, z_target.detach(), reduction="mean")
-        else: 
-            loss = F.mse_loss(z_pred, z_target.detach(), reduction="none")
+            loss = fn(z_pred, z_target.detach(), "mean")
+        else:
+            loss = fn(z_pred, z_target.detach(), "none")
             loss = einops.reduce(loss, "b ... -> b", "sum") # (B,) sum loss on all state, per batch
             loss = loss.mean()
 

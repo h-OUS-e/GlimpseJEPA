@@ -493,9 +493,11 @@ class Attention(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, causal=True):
+    def forward(self, x, window=None, causal=True):
         """
-        x : (B, T, D)
+        x: (B, T, D)
+        window: optional int. When set, attention is bounded to the last `window`
+            frames via a sliding causal mask instead of the full causal prefix.
         """
         x = self.norm(x)
         drop = self.dropout if self.training else 0.0
@@ -503,9 +505,24 @@ class Attention(nn.Module):
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
         q = apply_rope(q, theta=self.rope_theta)
         k = apply_rope(k, theta=self.rope_theta)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        # sliding window bounds context; otherwise fall back to plain causal masking
+        if window is not None:
+            mask = self.sliding_window_causal_mask(x.size(1), window, x.device)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=drop)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
+
+    def sliding_window_causal_mask(self, T, window_size, device):
+        """
+        Creates a mask to slide the window with limited data to the attention module.
+        Bool (T, T), True = attend. Causal AND within W-frame window.
+        """
+        i = torch.arange(T, device=device)[:, None] # query index (rows)
+        j = torch.arange(T, device=device)[None, :] # key index (columns)
+        return (j <= i) & (i - j < window_size)
+
     
 class Block(nn.Module):
     """Standard Transformer block"""
@@ -518,11 +535,11 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, window=None):
+        x = x + self.attn(self.norm1(x), window=window)
         x = x + self.mlp(self.norm2(x))
         return x
-    
+
 class Transformer(nn.Module):
     """Standard Transformer with support for AdaLN-zero blocks"""
 
@@ -575,7 +592,7 @@ class Transformer(nn.Module):
                 block_class(hidden_dim, heads, dim_head, mlp_dim, dropout, rope_theta=rope_theta)
             )
 
-    def forward(self, x, c=None):
+    def forward(self, x, c=None, window=None):
 
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
@@ -586,7 +603,7 @@ class Transformer(nn.Module):
         for block in self.layers:
             # If block layer is of class 'Block', it can only accept one input x
             # If it is of type 'ConditionalBlock', it takes x and c (c is condition or action in this case)
-            x = block(x) if isinstance(block, Block) else block(x, c)
+            x = block(x, window=window) if isinstance(block, Block) else block(x, c, window=window)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
@@ -617,11 +634,11 @@ class ConditionalBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c):
+    def forward(self, x, c, window=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), window=window)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
     
@@ -644,9 +661,11 @@ class ARPredictor(nn.Module):
         dropout=0.0,
         emb_dropout=0.0,
         rope_theta=10000.0,
+        window=None,
     ):
         super().__init__()
         self.num_frames = num_frames
+        self.window = window # bound attention to last `window` frames; None = full causal
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim,
@@ -671,7 +690,7 @@ class ARPredictor(nn.Module):
             c: (B, T, act_dim) encoded actions
         """
         x = self.dropout(x)
-        return self.transformer(x, c)
+        return self.transformer(x, c, window=self.window)
     
     
     

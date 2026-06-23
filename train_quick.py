@@ -38,6 +38,10 @@ lambd = 0.09 # sigreg loss coefficient
 lambd_recon = 0.1
 ar_steps = 0 # Teacher-forcing (used when ar_curriculum is False)
 
+# NextLat-style objective (arXiv:2511.05963)
+latent_loss = "smooth_l1" # "mse" (baseline) or "smooth_l1" (NextLat robustness)
+smooth_l1_beta = 1.0
+
 # DMT post-finetune (DAgger Memory Training): after training, freeze encoder+decoder and
 # unroll the predictor on its own predictions, regressing to the frozen encoder trajectory.
 # Corrects AR drift. Flip run_dmt=False to disable (behavior then unchanged).
@@ -55,10 +59,13 @@ z_dim_img = 36
 z_dim_action = 3
 depth_img_encoder = 3
 depth_predictor = 2
+context_window = None # bound predictor attention to last N frames; None = full causal prefix
 
 # memory predictor params
 use_memory = False
- # toggle for the memory A/B: True = memory on, False = no-memory baseline
+# "content" = memory concatenated to latent vector z
+# "adaln" = memory concatenated onto the action cond.
+mem_mode = "content"
 z_dim_memory = 36
 mem_hidden_dim = 256
 mem_depth = 2
@@ -100,9 +107,12 @@ action_encoder = ActionEncoder(input_dim_action, emb_dim=z_dim_action)
 
 # predictor = ARPredictorSimpleAdaLN(z_dim_img, z_dim_action, hidden_dim_predictor)
 # predictor = ARPredictorSimple(z_dim_img, z_dim_action, hidden_dim_predictor, depth=depth_predictor)
-# predictor condition is action (+ memory when enabled), so widen action_dim to match cond
-cond_dim = z_dim_action + (z_dim_memory if use_memory else 0)
-predictor = ARPredictor(num_frames=T_max, depth=4, heads=4, mlp_dim=512, input_dim=z_dim_img, hidden_dim=hidden_dim_predictor, output_dim=hidden_dim_predictor, action_dim=cond_dim)
+# cond width = action (+ memory only in "adaln"); "content" mode concatenates memory onto the INPUT.
+cond_dim = z_dim_action + (z_dim_memory if (use_memory and mem_mode == "adaln") else 0)
+# input WIDTH the predictor must accept: in "content" mode predict() does torch.cat([z_img, memory]),
+# so the input vector is z_dim_img + z_dim_memory wide (e.g. 36 + 36 = 72). This is dim sizing, not a sum.
+pred_input_dim = z_dim_img + (z_dim_memory if (use_memory and mem_mode == "content") else 0)
+predictor = ARPredictor(num_frames=T_max, depth=4, heads=4, mlp_dim=512, input_dim=pred_input_dim, hidden_dim=hidden_dim_predictor, output_dim=hidden_dim_predictor, action_dim=cond_dim, window=context_window)
 projector_pred = MLP_Projector(input_dim=hidden_dim_predictor, output_dim=z_dim_img, hidden_dim=256, norm_fn=torch.nn.BatchNorm1d)
 decoder = Decoder(z_dim=z_dim_img, hidden_dim=decoder_hidden_dim, h=H, w=W, depth=2)
 memory_predictor = MemoryPredictor(z_dim_img, z_dim_memory, hidden_dim=mem_hidden_dim, depth=mem_depth, heads=mem_heads) if use_memory else None
@@ -110,7 +120,7 @@ memory_predictor = MemoryPredictor(z_dim_img, z_dim_memory, hidden_dim=mem_hidde
 # drift (z_std 2-25) and destabilize training/decode; a non-affine LayerNorm fixes it.
 projector = nn.LayerNorm(z_dim_img, elementwise_affine=False)
 
-model = JEPA(image_encoder, predictor, action_encoder, decoder=decoder, projector=projector, projector_pred=projector_pred, memory_predictor=memory_predictor)
+model = JEPA(image_encoder, predictor, action_encoder, decoder=decoder, projector=projector, projector_pred=projector_pred, memory_predictor=memory_predictor, mem_mode=mem_mode)
 
 # 2. Move the model to the right device (cuda if available, else cpu).
 model = model.to(device)
@@ -212,8 +222,8 @@ for epoch in tqdm(range(epochs), desc="epochs"):
         # 7. JEPA loss
         # encode target images
         z_targets, _ = model.encode(target_images)
-        # get mse loss
-        loss_mse = model.mse(z_preds, z_targets, mean=False)
+        # get loss between predicted latent vector and actual latent vector
+        loss_mse = model.mse(z_preds, z_targets, mean=False, loss_type=latent_loss, beta=smooth_l1_beta)
         # get sigreg loss
         loss_sigreg = model.sigreg_loss(z_img)
         # recon loss on encoder's latents

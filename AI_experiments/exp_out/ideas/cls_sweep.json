@@ -1,0 +1,50 @@
+{
+  "cls16": {
+    "px": 0.03099348582327366,
+    "latent_floats": 16,
+    "cap": "small",
+    "tot_k": 210.528
+  },
+  "cls32": {
+    "px": 0.028205160051584244,
+    "latent_floats": 32,
+    "cap": "small",
+    "tot_k": 212.592
+  },
+  "cls64": {
+    "px": 0.026215139776468277,
+    "latent_floats": 64,
+    "cap": "small",
+    "tot_k": 216.72
+  },
+  "cls128": {
+    "px": 0.02938351035118103,
+    "latent_floats": 128,
+    "cap": "small",
+    "tot_k": 224.976
+  },
+  "cls256": {
+    "px": 0.028306948021054268,
+    "latent_floats": 256,
+    "cap": "small",
+    "tot_k": 241.488
+  },
+  "cls32_big": {
+    "px": 0.041211213916540146,
+    "latent_floats": 32,
+    "cap": "strong",
+    "tot_k": 1611.44
+  },
+  "cls128_big": {
+    "px": 0.039653655141592026,
+    "latent_floats": 128,
+    "cap": "strong",
+    "tot_k": 1636.112
+  },
+  "cls192_big": {
+    "px": 0.022664587944746017,
+    "latent_floats": 192,
+    "cap": "strong",
+    "tot_k": 1652.56
+  }
+}

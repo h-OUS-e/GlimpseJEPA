@@ -33,13 +33,13 @@ T_max = 10
 lr = 4e-4
 epochs = 20 #20
 viz_every = 1
-run_suffix = "noMemoryDMT" # optional tag appended to the dated plot dir: out/plots/YY_MMDD-{run_suffix}/
+run_suffix = "noMemoryDMT-win3-mse" # optional tag appended to the dated plot dir: out/plots/YY_MMDD-{run_suffix}/
 lambd = 0.09 # sigreg loss coefficient
 lambd_recon = 0.1
 ar_steps = 0 # Teacher-forcing (used when ar_curriculum is False)
 
 # NextLat-style objective (arXiv:2511.05963)
-latent_loss = "smooth_l1" # "mse" (baseline) or "smooth_l1" (NextLat robustness)
+latent_loss = "mse" # "mse" (baseline) or "smooth_l1" (NextLat robustness)
 smooth_l1_beta = 1.0
 
 # DMT post-finetune (DAgger Memory Training): after training, freeze encoder+decoder and
@@ -59,7 +59,7 @@ z_dim_img = 36
 z_dim_action = 3
 depth_img_encoder = 3
 depth_predictor = 2
-context_window = None # bound predictor attention to last N frames; None = full causal prefix
+context_window = 3 # bound predictor attention to last N frames; None = full causal prefix
 
 # memory predictor params
 use_memory = False
@@ -227,8 +227,8 @@ for epoch in tqdm(range(epochs), desc="epochs"):
         # get sigreg loss
         loss_sigreg = model.sigreg_loss(z_img)
         # recon loss on encoder's latents
-        # loss_recon  = model.recon_loss(z_preds, target_images) # use this if you want recon loss to effect predictor
-        loss_recon = model.recon_loss(z_img.detach(), input_images) # Use this if you don't want recon loss to effect predictor or encoder weights
+        loss_recon  = model.recon_loss(z_preds.detach(), target_images) # use this if you want recon loss to effect predictor
+        # loss_recon = model.recon_loss(z_img.detach(), input_images) # Use this if you don't want recon loss to effect predictor or encoder weights
         # get total loss
         loss = loss_mse + lambd * loss_sigreg + lambd_recon * loss_recon
 

@@ -10,13 +10,14 @@ Compares flat baseline / spatial-ST / spatial-warp, each with DMT post-finetune,
 
 Run: "C:/Users/Ous/miniconda3/envs/ML/python.exe" exp_warp.py [pretrain] [dmt]
 """
-import sys, json
-import torch, torch.nn as nn, torch.nn.functional as F
+import sys
+import json
+import torch
+import torch.nn as nn
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-import exp_ideas as E
-from exp_spatial_jepa import SpatialJEPA, ViTSpatialEncoder, ViTSpatialDecoder, plot_rollout, OUT
-from exp_dmt import dmt, eval_ar
-from glimpse import rollout
+import AI_experiments.exp_ideas as E
+from AI_experiments.exp_spatial_jepa import SpatialJEPA, plot_rollout, OUT
+from AI_experiments.exp_dmt import dmt, eval_ar
 
 DEV, T = E.DEV, E.T
 

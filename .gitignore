@@ -238,3 +238,4 @@ docs/
 .claude/settings.local.json
 
 # Others
+test_*.py

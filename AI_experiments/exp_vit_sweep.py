@@ -9,11 +9,14 @@ Does NOT modify jepa.py / ml_layers.py.
 Phase 1 (sweep):  "...python.exe" exp_vit_sweep.py sweep
 Phase 2 (cond):   "...python.exe" exp_vit_sweep.py cond p7 4    # patch, C of the small latent to augment
 """
-import sys, json
-import torch, torch.nn as nn, torch.nn.functional as F
+import sys
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-import exp_ideas as E
+import AI_experiments.exp_ideas as E
 from glimpse import rollout
 from ml_layers import ARPredictor
 
